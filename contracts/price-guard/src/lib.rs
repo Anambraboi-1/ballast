@@ -71,6 +71,8 @@ struct AssetGuardConfig {
     band_bps: u32,
     daily_move_band_bps: u32,
     max_staleness_s: u64,
+    window_seconds: u64,
+    window_move_band_bps: u32,
 }
 
 #[contracttype]
@@ -93,6 +95,8 @@ enum DataKey {
     /// live computation comes back `Degraded`/`Halted` (PRD §6.4: "existing positions keep the
     /// last good price").
     LastGood(Address),
+    RollingReference(Address),
+    RollingReferenceUpdated(Address),
     /// Set once a `Halted` status is observed; cleared only by `confirm_halt_cleared`. While set,
     /// `guarded_price` reports `Halted` regardless of what a fresh read would otherwise say.
     Halted(Address),
@@ -442,6 +446,58 @@ fn evaluate(env: &Env, asset: Address) -> GuardedPrice {
         }
     }
 
+    // Rolling reference: catches slow cumulative drift that stays inside `daily_move_band_bps` on
+    // each individual step. The reference is refreshed at most once per `window_seconds`, so a
+    // publisher ramping the price a little on every publish eventually trips the window band even
+    // though every single step passed the daily band.
+    let rolling_ref: Option<i128> = env
+        .storage()
+        .instance()
+        .get(&DataKey::RollingReference(asset.clone()));
+    let rolling_ref_ts: Option<u64> = env
+        .storage()
+        .instance()
+        .get(&DataKey::RollingReferenceUpdated(asset.clone()));
+
+    if let Some(reference) = rolling_ref {
+        if reference > 0 {
+            let drift_bps = (((median_value - reference).abs()) * 10_000) / reference;
+            if drift_bps > config.window_move_band_bps as i128 {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Halted(asset.clone()), &true);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PendingHaltValue(asset.clone()), &median_value);
+                // Report the last good value, like every other Halted path, not the older reference.
+                let held = last_good.unwrap_or(reference);
+                env.events().publish(
+                    (Symbol::new(env, "halt_latched"), asset.clone()),
+                    (held, median_value),
+                );
+                check_and_emit_status_change(env, &asset, PriceStatus::Halted, held);
+                return GuardedPrice {
+                    asset,
+                    value: held,
+                    status: PriceStatus::Halted,
+                    ts: now,
+                    sources: fresh_sources,
+                };
+            }
+        }
+    }
+
+    // Refresh the rolling reference only once per window. Leaving it in place between refreshes is
+    // what makes a slow ramp accumulate against a fixed baseline instead of chasing the price.
+    if rolling_ref_ts.map_or(true, |ts| now.saturating_sub(ts) >= config.window_seconds) {
+        env.storage()
+            .instance()
+            .set(&DataKey::RollingReference(asset.clone()), &median_value);
+        env.storage()
+            .instance()
+            .set(&DataKey::RollingReferenceUpdated(asset.clone()), &now);
+    }
+
     env.storage()
         .instance()
         .set(&DataKey::LastGood(asset.clone()), &median_value);
@@ -539,6 +595,8 @@ impl PriceGuard {
         asset: Address,
         band_bps: u32,
         daily_move_band_bps: u32,
+        window_seconds: u64,
+        window_move_band_bps: u32,
         max_staleness_s: u64,
     ) {
         admin.require_auth();
@@ -549,6 +607,8 @@ impl PriceGuard {
             &AssetGuardConfig {
                 band_bps,
                 daily_move_band_bps,
+                window_seconds,
+                window_move_band_bps,
                 max_staleness_s,
             },
         );
@@ -558,7 +618,13 @@ impl PriceGuard {
         );
         env.events().publish(
             (Symbol::new(&env, "configure_asset"), asset),
-            (band_bps, daily_move_band_bps, max_staleness_s),
+            (
+                band_bps,
+                daily_move_band_bps,
+                window_seconds,
+                window_move_band_bps,
+                max_staleness_s,
+            ),
         );
     }
 
@@ -712,6 +778,15 @@ impl PriceGuard {
             new_last_good = pending;
             env.storage()
                 .instance()
+                .set(&DataKey::RollingReference(asset.clone()), &pending);
+            env.storage()
+                .instance()
+                .set(
+                    &DataKey::RollingReferenceUpdated(asset.clone()),
+                    &env.ledger().timestamp(),
+                );
+            env.storage()
+                .instance()
                 .remove(&DataKey::PendingHaltValue(asset.clone()));
         } else if let Some(last) = env
             .storage()
@@ -734,9 +809,31 @@ mod test {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger};
 
+    /// Default rolling window used by most tests: 24h, with a 1% (100 bp) window band. A publisher
+    /// ramping the price a little on every publish trips this eventually; ordinary yield (a few bp
+    /// per day) stays well inside it.
+    const DEFAULT_WINDOW_SECONDS: u64 = 86_400;
+    const DEFAULT_WINDOW_MOVE_BAND_BPS: u32 = 100;
+
     fn setup_with_admin(
         band_bps: u32,
         daily_move_band_bps: u32,
+        max_staleness_s: u64,
+    ) -> (Env, PriceGuardClient<'static>, Address, Address, Address, Address) {
+        setup_with_admin_and_window(
+            band_bps,
+            daily_move_band_bps,
+            DEFAULT_WINDOW_SECONDS,
+            DEFAULT_WINDOW_MOVE_BAND_BPS,
+            max_staleness_s,
+        )
+    }
+
+    fn setup_with_admin_and_window(
+        band_bps: u32,
+        daily_move_band_bps: u32,
+        window_seconds: u64,
+        window_move_band_bps: u32,
         max_staleness_s: u64,
     ) -> (Env, PriceGuardClient<'static>, Address, Address, Address, Address) {
         let env = Env::default();
@@ -758,6 +855,8 @@ mod test {
             &asset,
             &band_bps,
             &daily_move_band_bps,
+            &window_seconds,
+            &window_move_band_bps,
             &max_staleness_s,
         );
 
@@ -1283,10 +1382,36 @@ mod test {
         assert_eq!((price.status, price.value), (PriceStatus::Ok, jumped));
     }
 
-    /// Yield accrues steadily; the baseline has to follow it or ordinary drift eventually looks like a
-    /// jump. Each step here is under the 1% band, the total is not, and nobody reads the price in between.
+    /// Ordinary yield must never trip the guard. One basis point an hour for a full day is 24 bp in
+    /// total: every step is under the daily band, and the total stays inside the 100 bp window band.
     #[test]
     fn steady_drift_in_small_steps_never_halts() {
+        let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
+        let code = asset_code(&env);
+        let sig = BytesN::from_array(&env, &[0u8; 64]);
+        let mut now = env.ledger().timestamp();
+        let mut value = SCALE;
+        client.publish_nav(&publisher, &asset, &code, &value, &now, &sig);
+        client.publish_source(&publisher, &asset, &feed(&env), &value, &now);
+
+        for _ in 0..24 {
+            now += 3_600;
+            env.ledger().set_timestamp(now);
+            value = value * 10_001 / 10_000; // +1 bp per hour
+            client.publish_nav(&publisher, &asset, &code, &value, &now, &sig);
+            client.publish_source(&publisher, &asset, &feed(&env), &value, &now);
+        }
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok, "realistic yield drift must not halt");
+        assert_eq!(price.value, value);
+    }
+
+    /// The other side of the same coin: a publisher ramping the price a little on every publish.
+    /// Each step passes the daily band (so the old consecutive check alone would never fire), but
+    /// the cumulative move against the rolling reference trips the window band and halts.
+    #[test]
+    fn a_slow_ramp_beyond_the_window_band_halts() {
         let (env, client, publisher, _risk, asset) = setup(50, 100, 3600);
         let code = asset_code(&env);
         let sig = BytesN::from_array(&env, &[0u8; 64]);
@@ -1294,16 +1419,20 @@ mod test {
         let mut value = SCALE;
         client.publish_nav(&publisher, &asset, &code, &value, &now, &sig);
         client.publish_source(&publisher, &asset, &feed(&env), &value, &now);
+        assert_eq!(client.guarded_price(&asset).status, PriceStatus::Ok);
 
-        for _ in 0..4 {
-            value = value * 1_006 / 1_000; // +0.6% per step, +2.4% in total
+        // +0.9% per publish: inside the 1% daily band on every step, +2.7% by the third publish.
+        for _ in 0..3 {
+            value = value * 1_009 / 1_000;
             client.publish_nav(&publisher, &asset, &code, &value, &now, &sig);
             client.publish_source(&publisher, &asset, &feed(&env), &value, &now);
         }
 
         let price = client.guarded_price(&asset);
-        assert_eq!(price.status, PriceStatus::Ok, "drift in small steps must not halt");
-        assert_eq!(price.value, value);
+        assert_eq!(price.status, PriceStatus::Halted, "slow ramp must trip the window band");
+        // The second step (+1.8% against the reference) trips it; the value held is the last good
+        // one, the first step's, the same as for a daily-band halt.
+        assert_eq!(price.value, SCALE * 1_009 / 1_000);
     }
 
     #[test]
@@ -1499,7 +1628,7 @@ mod test {
         };
 
         // 1. configure_asset event
-        client.configure_asset(&admin, &asset, &50, &100, &3600);
+        client.configure_asset(&admin, &asset, &50, &100, &86_400, &100, &3600);
         let events = env.events().all();
         assert!(has_event(&events, "configure_asset"), "configure_asset event must be emitted");
 
@@ -1554,19 +1683,20 @@ mod test {
             invoke: &MockAuthInvoke {
                 contract: &client.address,
                 fn_name: "configure_asset",
-                args: (stranger.clone(), new_asset.clone(), 60u32, 120u32, 1800u64).into_val(&env),
+                args: (stranger.clone(), new_asset.clone(), 60u32, 120u32, 86_400u64, 100u32, 1800u64)
+                    .into_val(&env),
                 sub_invokes: &[],
             },
         }]);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.configure_asset(&stranger, &new_asset, &60, &120, &1800);
+            client.configure_asset(&stranger, &new_asset, &60, &120, &86_400, &100, &1800);
         }));
         assert!(result.is_err(), "only the stored admin may configure an asset");
 
         // Scoped auths cannot be built for generated contract addresses, so the real admin's
         // success path runs under mock_all_auths like the rest of this module.
         env.mock_all_auths();
-        client.configure_asset(&admin, &new_asset, &60, &120, &1800);
+        client.configure_asset(&admin, &new_asset, &60, &120, &86_400, &100, &1800);
     }
 
     #[test]
