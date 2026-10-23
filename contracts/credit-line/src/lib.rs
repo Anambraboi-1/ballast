@@ -310,6 +310,7 @@ impl CreditLine {
         ttl::extend_instance(&env);
         let _ = admin;
         access::require_admin(&env);
+        thresholds.validate();
         env.storage().instance().set(
             &DataKey::AssetConfig(asset),
             &AssetConfig {
