@@ -128,6 +128,8 @@ fn setup() -> Harness {
     let rwa = env.register(MockToken, ());
     let usdc = env.register(MockToken, ());
 
+    ExitDeskClient::new(&env, &desk).set_usdc(&admin, &usdc);
+
     Harness {
         env,
         desk,
@@ -355,6 +357,70 @@ fn only_the_admin_can_withdraw() {
 }
 
 #[test]
+fn set_usdc_configures_token_and_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let desk = env.register(ExitDesk, ());
+    ExitDeskClient::new(&env, &desk).initialize(
+        &admin,
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+    );
+    let usdc = env.register(MockToken, ());
+    let client = ExitDeskClient::new(&env, &desk);
+    client.set_usdc(&admin, &usdc);
+    assert_eq!(client.usdc(), usdc);
+}
+
+#[test]
+#[should_panic(expected = "exit-desk: admin argument mismatch")]
+fn set_usdc_rejects_non_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let desk = env.register(ExitDesk, ());
+    ExitDeskClient::new(&env, &desk).initialize(
+        &admin,
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+    );
+    let stranger = Address::generate(&env);
+    let usdc = env.register(MockToken, ());
+    ExitDeskClient::new(&env, &desk).set_usdc(&stranger, &usdc);
+}
+
+#[test]
+#[should_panic(expected = "exit-desk: usdc not configured")]
+fn fund_panics_if_usdc_unset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let desk = env.register(ExitDesk, ());
+    ExitDeskClient::new(&env, &desk).initialize(
+        &admin,
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+    );
+    let usdc = env.register(MockToken, ());
+    MockTokenClient::new(&env, &usdc).mint(&admin, &(1_000 * PRICE_SCALE));
+    ExitDeskClient::new(&env, &desk).fund(&admin, &usdc, &(1_000 * PRICE_SCALE));
+}
+
+#[test]
+#[should_panic(expected = "exit-desk: usdc address mismatch")]
+fn fund_panics_on_mismatched_usdc() {
+    let h = setup();
+    let wrong_token = Address::generate(&h.env);
+    ExitDeskClient::new(&h.env, &h.desk).fund(&h.admin, &wrong_token, &(1_000 * PRICE_SCALE));
+}
+
 fn disabled_asset_blocks_quote_and_exit_but_allows_withdraw_and_reenable() {
     let h = setup();
     configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
