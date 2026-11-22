@@ -19,6 +19,8 @@ Events follow the same convention as `PledgeVault`: one event per state change, 
 | `interest_withdrawn` | `(Symbol("interest_withdrawn"), line: u64)` | `(lender: Address, amount: i128, claimable_after: i128)` | `withdraw_interest` |
 | `collateral_synced` | `(Symbol("collateral_synced"), line: u64)` | `(asset: Address, units: i128, source: Symbol)` (`vault` / `keeper` / `admin`) | `sync_from_vault`, `sync_collateral` |
 | `margin_state_changed` | `(Symbol("margin_state_changed"), line: u64)` | `(from: MarginState, to: MarginState, ltv_bps: u32, price: i128)` | `poke` |
+| `asset_configured` | `(Symbol("asset_configured"), asset: Address)` | `(price_guard: Address, usdc: Address, haircut_bps: u32, thresholds: MarginThresholds)` | `configure_asset` |
+| `vault_set` | `(Symbol("vault_set"),)` | `vault: Address` | `set_vault` |
 
 `undrawn_withdrawn` is published after the state write, so `funded_after` is the line's `funded`
 figure once the withdrawal has been applied (`funded_before - amount`). A reverted withdrawal
