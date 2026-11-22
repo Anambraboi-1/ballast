@@ -136,6 +136,11 @@ change are not re-checked; calling `configure_asset` again is the only way to re
   contract between transactions.
 - Quotes are the guarded price less the spread, rounded down (in the desk's favour), and refuse any
   price that is not `Ok`.
+- `exit` compares the desk's own USDC balance with the payout before it takes the holder's RWA, and
+  refuses with `exit-desk: insufficient USDC float` when the balance is smaller. This is for a
+  readable error, not for safety: the swap was already atomic, and a short float used to fail in the
+  USDC token's own transfer. `available_usdc` is the same balance as a free read; like a quote, it
+  can be out of date by the time an exit lands.
 
 ## RepoDvP
 
