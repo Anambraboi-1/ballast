@@ -15,6 +15,7 @@ Events follow the same convention as `PledgeVault`: one event per state change, 
 |---|---|---|---|
 | `undrawn_withdrawn` | `(Symbol("undrawn_withdrawn"), line: u64)` | `(lender: Address, amount: i128, funded_after: i128)` | `withdraw_undrawn` |
 | `line_closed` | `(Symbol("line_closed"), line: u64)` | `(debt: i128, recovered: i128, surplus: i128, shortfall: i128)` | `close_liquidated` |
+| `liquidation_started` | `(Symbol("liquidation_started"), line: u64)` | `(route: LiquidationRoute, seized_units: i128, price: i128, debt: i128)` | `liquidate` |
 
 `undrawn_withdrawn` is published after the state write, so `funded_after` is the line's `funded`
 figure once the withdrawal has been applied (`funded_before - amount`). A reverted withdrawal
