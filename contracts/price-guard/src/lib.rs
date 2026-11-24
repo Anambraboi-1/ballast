@@ -2763,6 +2763,99 @@ mod test {
         assert_eq!(price.value, v2);
     }
 
+    /// Publishes `values` as sources named `src1`, `src2`, ... all stamped with the current ledger
+    /// time, so up to the 8-source limit stay fresh for the whole test.
+    fn publish_numbered_sources(
+        env: &Env,
+        client: &PriceGuardClient<'static>,
+        publisher: &Address,
+        asset: &Address,
+        values: &[i128],
+    ) {
+        const NAMES: [&str; 5] = ["src1", "src2", "src3", "src4", "src5"];
+        let now = env.ledger().timestamp();
+        for (name, value) in NAMES.iter().zip(values.iter()) {
+            client.publish_source(publisher, asset, &Symbol::new(env, name), value, &now);
+        }
+    }
+
+    #[test]
+    fn three_fresh_sources_within_band_return_the_median_not_the_mean_or_extremes() {
+        // 50 bps band. 1.000, 1.002 and 1.004 spread by 40 bps, so all three are in band.
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let low = SCALE;
+        let mid = SCALE + 20_000; // 1.002
+        let high = SCALE + 40_000; // 1.004
+
+        // Published out of order so the result cannot come from insertion order.
+        publish_numbered_sources(&env, &client, &publisher, &asset, &[high, low, mid]);
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, mid);
+        assert_eq!(price.sources.len(), 3);
+    }
+
+    #[test]
+    fn three_sources_with_an_outlier_beyond_the_band_degrade_and_keep_the_last_good_value() {
+        let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
+        let last_good = SCALE + 10_000; // 1.010
+        let new_median = SCALE + 20_000; // 1.002
+
+        // Establish a last good value that differs from the next round's median, so the value
+        // assertion proves the guard kept the old price rather than returning the new median.
+        publish_numbered_sources(
+            &env,
+            &client,
+            &publisher,
+            &asset,
+            &[last_good, last_good, last_good],
+        );
+        let good = client.guarded_price(&asset);
+        assert_eq!(good.status, PriceStatus::Ok);
+        assert_eq!(good.value, last_good);
+
+        // The outlier round's median is 1.002, but the extremes (1.000 and 1.060) are 600 bps
+        // apart, well past the 50 bps band. A degraded result must keep 1.010, not 1.002.
+        publish_numbered_sources(
+            &env,
+            &client,
+            &publisher,
+            &asset,
+            &[SCALE, new_median, SCALE + 600_000],
+        );
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Degraded);
+        assert_eq!(price.value, last_good);
+        assert_ne!(price.value, new_median);
+    }
+
+    #[test]
+    fn five_fresh_sources_within_band_return_the_middle_value() {
+        // 100 bps band. The five values span 80 bps. The mean is 1.0038 and the mid-range is
+        // 1.0040, so neither would be mistaken for the median, 1.0030.
+        let (env, client, publisher, _risk, asset) = setup(100, 10_000, 3600);
+        let values = [
+            SCALE,          // 1.0000
+            SCALE + 10_000, // 1.0010
+            SCALE + 30_000, // 1.0030 (median)
+            SCALE + 70_000, // 1.0070
+            SCALE + 80_000, // 1.0080
+        ];
+        let mean = values.iter().sum::<i128>() / 5;
+        assert_ne!(mean, values[2]);
+
+        publish_numbered_sources(&env, &client, &publisher, &asset, &[
+            values[3], values[0], values[4], values[2], values[1],
+        ]);
+
+        let price = client.guarded_price(&asset);
+        assert_eq!(price.status, PriceStatus::Ok);
+        assert_eq!(price.value, values[2]);
+        assert_eq!(price.sources.len(), 5);
+    }
+
     #[test]
     fn last_good_is_none_until_the_asset_reaches_ok_then_tracks_the_median() {
         let (env, client, publisher, _risk, asset) = setup(50, 10_000, 3600);
