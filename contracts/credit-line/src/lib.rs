@@ -4344,4 +4344,65 @@ mod test {
         let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
         h.credit_line.owed(&999);
     }
+
+    // --- sync_collateral / sync_from_vault validation and auth (#162) -------------------------
+
+    #[test]
+    fn sync_collateral_accepts_admin_and_keeper() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(100 * PRICE_SCALE));
+        assert_eq!(h.credit_line.line(&id).pledged_units, 100 * PRICE_SCALE);
+
+        h.credit_line
+            .sync_collateral(&h.keeper, &id, &(200 * PRICE_SCALE));
+        assert_eq!(h.credit_line.line(&id).pledged_units, 200 * PRICE_SCALE);
+    }
+
+    #[test]
+    #[should_panic(expected = "ballast-common: caller is neither admin nor keeper")]
+    fn sync_collateral_rejects_a_stranger() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&Address::generate(&h.env), &id, &(100 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: units cannot be negative")]
+    fn sync_collateral_rejects_negative_units() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &-1);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: units cannot be negative")]
+    fn sync_from_vault_rejects_negative_units() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_from_vault(&h.vault.address, &id, &h.asset, &-1);
+    }
+
+    #[test]
+    fn sync_from_vault_and_sync_collateral_can_record_zero_units() {
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+
+        h.credit_line
+            .sync_from_vault(&h.vault.address, &id, &h.asset, &(500 * PRICE_SCALE));
+        assert_eq!(h.credit_line.line(&id).pledged_units, 500 * PRICE_SCALE);
+
+        h.credit_line
+            .sync_from_vault(&h.vault.address, &id, &h.asset, &0);
+        assert_eq!(h.credit_line.line(&id).pledged_units, 0);
+
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(300 * PRICE_SCALE));
+        h.credit_line.sync_collateral(&h.keeper, &id, &0);
+        assert_eq!(h.credit_line.line(&id).pledged_units, 0);
+    }
 }
