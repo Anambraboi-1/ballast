@@ -94,6 +94,12 @@ the amount actually applied (`min(amount, owed)`), and `drawn_after` is the line
 principal. Together they are the repayment `(principal, interest)` split the ledger needs, without
 recomputing it from a pre-state. A reverted repayment publishes nothing.
 
+`close_liquidated` verifies cross-contract that the collateral position in `PledgeVault` has been
+fully cleared (`position_units(line, asset) == 0`) before permitting the line to close and settling
+surplus or shortfall. If no vault is configured, closing is allowed only if zero collateral units
+were pledged or seized (`record.seized_units == 0 && state.pledged_units == 0`); if any collateral
+was pledged/seized, closing without a configured vault panics with `"credit-line: vault not configured"`.
+
 ## Building and testing
 
 `cargo test -p ballast-credit-line` from `contracts/` runs the unit tests on the host target.
