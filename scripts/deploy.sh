@@ -150,6 +150,9 @@ retry stellar contract invoke --id "${CID[pledge-vault]}" --source admin --netwo
   --admin "$ADMIN" --asset "$RWA_SAC" --credit_line "${CID[credit-line]}" \
   --custody_mode '"Escrow"' >/dev/null
 
+# These thresholds must match the API's API_MARGIN_WARNING_BPS / API_MARGIN_CALL_BPS /
+# API_MARGIN_LIQUIDATION_BPS (defaults 7000/8000/9000), or the API's fallback margin state and
+# release check disagree with the chain.
 log "Configuring CreditLine for RWA1/TUSD"
 retry stellar contract invoke --id "${CID[credit-line]}" --source admin --network "$NETWORK" -- configure_asset \
   --admin "$ADMIN" --asset "$RWA_SAC" --price_guard "${CID[price-guard]}" --usdc "$USDC_SAC" \
