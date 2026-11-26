@@ -1814,6 +1814,115 @@ mod test {
         assert_eq!(h.credit_line.line(&id).unhealthy_since, None);
     }
 
+    // --- poke: breach arming (#159) -------------------------------------------------------
+
+    /// A line with 1,000 units pledged and `drawn` borrowed against them, priced at $1 with no
+    /// haircut, so the LTV at price `p` is exactly `drawn / (1,000 * p)`. The ledger timestamp is
+    /// never advanced, so no interest accrues and the LTVs in these tests stay exact.
+    fn drawn_line(h: &Harness, drawn: i128) -> u64 {
+        let id = open_and_fund(h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line.draw(&h.borrower, &id, &drawn, &h.borrower.clone());
+        id
+    }
+
+    /// `poke` arms `breach_ledger` on the first `Liquidation` read at an `Ok` price, keeps the
+    /// first ledger (and its LTV) on later pokes, and clears it once the price is no longer `Ok`
+    /// or the position is no longer in `Liquidation`.
+    #[test]
+    fn poke_arms_the_breach_once_and_clears_it_on_a_degraded_price_or_recovery() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = drawn_line(&h, 600 * PRICE_SCALE);
+        assert_eq!(h.credit_line.line(&id).breach_ledger, None);
+
+        // $0.64: 600 against 640 -> 9,375 bps (Liquidation). Arms at ledger N.
+        let n = 100;
+        h.env.ledger().set_sequence_number(n);
+        h.price_guard.set_price(&(64 * PRICE_SCALE / 100), &PriceStatus::Ok);
+        assert_eq!(h.credit_line.poke(&id), MarginState::Liquidation);
+        let line = h.credit_line.line(&id);
+        assert_eq!(line.breach_ledger, Some(n));
+        assert_eq!(line.breach_ltv_bps, 9_375);
+
+        // Five ledgers later, deeper in Liquidation ($0.60 -> 10,000 bps): the first ledger and
+        // the LTV it was flagged at both stay put.
+        h.env.ledger().set_sequence_number(n + 5);
+        h.price_guard.set_price(&(60 * PRICE_SCALE / 100), &PriceStatus::Ok);
+        assert_eq!(h.credit_line.poke(&id), MarginState::Liquidation);
+        let line = h.credit_line.line(&id);
+        assert_eq!(line.breach_ledger, Some(n));
+        assert_eq!(line.breach_ltv_bps, 9_375);
+
+        // Same crash price but Degraded: still classified Liquidation, but the breach clears.
+        h.env.ledger().set_sequence_number(n + 6);
+        h.price_guard.set_price(&(60 * PRICE_SCALE / 100), &PriceStatus::Degraded);
+        assert_eq!(h.credit_line.poke(&id), MarginState::Liquidation);
+        let line = h.credit_line.line(&id);
+        assert_eq!(line.breach_ledger, None);
+        assert_eq!(line.breach_ltv_bps, 0);
+
+        // Back to Ok and still breached: arms afresh at the current ledger, not the old one.
+        h.env.ledger().set_sequence_number(n + 7);
+        h.price_guard.set_price(&(60 * PRICE_SCALE / 100), &PriceStatus::Ok);
+        assert_eq!(h.credit_line.poke(&id), MarginState::Liquidation);
+        let line = h.credit_line.line(&id);
+        assert_eq!(line.breach_ledger, Some(n + 7));
+        assert_eq!(line.breach_ltv_bps, 10_000);
+
+        // Price recovers to $1 at Ok: 600 against 1,000 -> 6,000 bps (Healthy). Cleared.
+        h.env.ledger().set_sequence_number(n + 8);
+        h.price_guard.set_price(&PRICE_SCALE, &PriceStatus::Ok);
+        assert_eq!(h.credit_line.poke(&id), MarginState::Healthy);
+        let line = h.credit_line.line(&id);
+        assert_eq!(line.breach_ledger, None);
+        assert_eq!(line.breach_ltv_bps, 0);
+    }
+
+    /// A `Liquidation` read at a `Degraded` or `Halted` price never arms the breach, so a later
+    /// `liquidate` has nothing to confirm.
+    #[test]
+    fn poke_does_not_arm_the_breach_on_a_degraded_or_halted_price() {
+        for status in [PriceStatus::Degraded, PriceStatus::Halted] {
+            let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+            let id = drawn_line(&h, 600 * PRICE_SCALE);
+
+            h.env.ledger().set_sequence_number(100);
+            h.price_guard.set_price(&(64 * PRICE_SCALE / 100), &status);
+            assert_eq!(h.credit_line.poke(&id), MarginState::Liquidation);
+            let line = h.credit_line.line(&id);
+            assert_eq!(line.breach_ledger, None, "{status:?} must not arm the breach");
+            assert_eq!(line.breach_ltv_bps, 0);
+
+            // A second poke on a later ledger at the same status still does not arm it.
+            h.env.ledger().set_sequence_number(105);
+            assert_eq!(h.credit_line.poke(&id), MarginState::Liquidation);
+            assert_eq!(h.credit_line.line(&id).breach_ledger, None);
+        }
+    }
+
+    /// `poke` returns the classified state for each band below `Liquidation`, and none of them
+    /// arms the breach. 510 drawn against 1,000 units lands exactly on 7,500 / 8,500 / 5,000 bps.
+    #[test]
+    fn poke_returns_warning_margin_call_and_healthy_without_arming_the_breach() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = drawn_line(&h, 510 * PRICE_SCALE);
+
+        for (price, bps, expected) in [
+            (68 * PRICE_SCALE / 100, 7_500, MarginState::Warning),
+            (60 * PRICE_SCALE / 100, 8_500, MarginState::MarginCall),
+            (102 * PRICE_SCALE / 100, 5_000, MarginState::Healthy),
+        ] {
+            h.env.ledger().set_sequence_number(h.env.ledger().sequence() + 1);
+            h.price_guard.set_price(&price, &PriceStatus::Ok);
+            assert_eq!(h.credit_line.ltv(&id).ltv_bps, bps);
+            assert_eq!(h.credit_line.poke(&id), expected);
+            let line = h.credit_line.line(&id);
+            assert_eq!(line.margin_state, expected);
+            assert_eq!(line.breach_ledger, None);
+            assert_eq!(line.breach_ltv_bps, 0);
+        }
+    }
+
     #[test]
     fn closing_a_shortfall_books_the_loss_and_frees_the_rest_of_the_funding() {
         let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
