@@ -153,6 +153,27 @@ pub struct LtvView {
     pub price_status: PriceStatus,
 }
 
+/// Exact payoff breakdown for a credit line, read without a PriceGuard call (PRD §9, #131).
+/// `total` is what `repay` would need right now and always equals `debt_of(line)`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Owed {
+    /// Principal drawn and not yet repaid.
+    pub principal: i128,
+    /// Interest already booked on the line (at the last accrual).
+    pub accrued_interest: i128,
+    /// Interest accrued since `last_accrual_ts` and not yet booked.
+    pub pending_interest: i128,
+    /// Platform fee already booked on the line (at the last accrual).
+    pub accrued_fee: i128,
+    /// Platform fee accrued since `last_accrual_ts` and not yet booked.
+    pub pending_fee: i128,
+    /// `principal + accrued_interest + pending_interest + accrued_fee + pending_fee`.
+    pub total: i128,
+    /// Ledger timestamp the figures are valid for.
+    pub as_of: u64,
+}
+
 /// Per-asset config for lines drawn against `asset` (see module docs on the Registry
 /// simplification). Mirrors `pledge-vault`'s `AssetConfig` shape since both crates are owned
 /// together in this pass, though the two are never cross-called against each other for config.
@@ -1114,14 +1135,32 @@ impl CreditLine {
     /// vault, deciding whether a release puts anything at risk) cannot be blocked by a degraded or
     /// halted price feed.
     pub fn debt_of(env: Env, line: u64) -> i128 {
+        Self::owed(env, line).total
+    }
+
+    /// The exact payoff breakdown for `line` at the current ledger time (#131): principal, booked
+    /// and pending interest, booked and pending platform fee, the total, and the timestamp it is
+    /// valid for. Like `debt_of` (which returns its `total`), it reads no price and makes no
+    /// PriceGuard call, so it keeps working when the price is degraded or the guard is down.
+    pub fn owed(env: Env, line: u64) -> Owed {
         ttl::extend_instance(&env);
         let state = read_line(&env, line);
         let now = env.ledger().timestamp();
-        state.drawn
-            + state.accrued_interest
-            + interest_delta(&state, now)
-            + state.accrued_fee
-            + fee_delta(&state, now)
+        let pending_interest = interest_delta(&state, now);
+        let pending_fee = fee_delta(&state, now);
+        Owed {
+            principal: state.drawn,
+            accrued_interest: state.accrued_interest,
+            pending_interest,
+            accrued_fee: state.accrued_fee,
+            pending_fee,
+            total: state.drawn
+                + state.accrued_interest
+                + pending_interest
+                + state.accrued_fee
+                + pending_fee,
+            as_of: now,
+        }
     }
 
     /// A minimal, dedicated getter so `PledgeVault::release` can verify a caller actually owns
@@ -4170,5 +4209,139 @@ mod test {
         h.credit_line
             .withdraw_interest(&h.lender, &id, &(50 * PRICE_SCALE));
         assert_eq!(h.token.balance(&h.lender) - before, 50 * PRICE_SCALE);
+    }
+
+    // --- owed (#131) ------------------------------------------------------------------------
+
+    #[test]
+    fn owed_breaks_down_the_payoff_and_matches_debt_of_and_ltv() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id, &(500 * PRICE_SCALE), &h.borrower.clone());
+
+        let t0 = h.env.ledger().timestamp();
+        let owed0 = h.credit_line.owed(&id);
+        assert_eq!(
+            owed0,
+            Owed {
+                principal: 500 * PRICE_SCALE,
+                accrued_interest: 0,
+                pending_interest: 0,
+                accrued_fee: 0,
+                pending_fee: 0,
+                total: 500 * PRICE_SCALE,
+                as_of: t0,
+            }
+        );
+        assert_eq!(owed0.total, h.credit_line.debt_of(&id));
+        assert_eq!(owed0.total, h.credit_line.ltv(&id).debt);
+
+        // One year at 10% on 500 is 50 of pending interest.
+        let year = 365 * 24 * 60 * 60;
+        h.env.ledger().set_timestamp(t0 + year);
+        let owed1 = h.credit_line.owed(&id);
+        assert_eq!(owed1.pending_interest, 50 * PRICE_SCALE);
+        assert_eq!(owed1.total, 550 * PRICE_SCALE);
+        assert_eq!(owed1.as_of, t0 + year);
+        assert_eq!(owed1.total, h.credit_line.debt_of(&id));
+        assert_eq!(owed1.total, h.credit_line.ltv(&id).debt);
+
+        // Repaying 50 clears the interest; half a year later 25 more is pending.
+        h.token.mint(&h.borrower, &(50 * PRICE_SCALE));
+        h.credit_line.repay(&h.borrower, &id, &(50 * PRICE_SCALE));
+        let owed2 = h.credit_line.owed(&id);
+        assert_eq!((owed2.accrued_interest, owed2.pending_interest), (0, 0));
+        assert_eq!(owed2.total, 500 * PRICE_SCALE);
+        h.env.ledger().set_timestamp(t0 + year + year / 2);
+        let owed3 = h.credit_line.owed(&id);
+        assert_eq!(owed3.pending_interest, 25 * PRICE_SCALE);
+        assert_eq!(owed3.total, h.credit_line.ltv(&id).debt);
+    }
+
+    /// With a platform fee, `owed` reports booked and pending fee separately and its total still
+    /// equals `debt_of` and `ltv().debt`, so `debt_of` (which returns `owed().total`) never
+    /// under-reports what the borrower must repay.
+    #[test]
+    fn owed_includes_the_platform_fee() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = h.credit_line.open(
+            &h.lender,
+            &h.borrower,
+            &h.asset,
+            &(1_000 * PRICE_SCALE),
+            &1_000,
+            &200,
+            &86_400,
+            &BytesN::from_array(&h.env, &[7u8; 32]),
+        );
+        h.token.mint(&h.lender, &(1_000 * PRICE_SCALE));
+        h.credit_line.fund(&h.lender, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id, &(500 * PRICE_SCALE), &h.borrower.clone());
+
+        // One year: 10% interest = 50, 2% fee = 10, both still pending.
+        let t0 = h.env.ledger().timestamp();
+        let year = 365 * 24 * 60 * 60;
+        h.env.ledger().set_timestamp(t0 + year);
+        let owed = h.credit_line.owed(&id);
+        assert_eq!(owed.pending_interest, 50 * PRICE_SCALE);
+        assert_eq!(owed.pending_fee, 10 * PRICE_SCALE);
+        assert_eq!(owed.accrued_fee, 0);
+        assert_eq!(owed.total, 560 * PRICE_SCALE);
+        assert_eq!(owed.total, h.credit_line.debt_of(&id));
+        assert_eq!(owed.total, h.credit_line.ltv(&id).debt);
+
+        // A partial repayment books the accrual (fee first), so the rest moves to `accrued_*`.
+        h.token.mint(&h.borrower, &(5 * PRICE_SCALE));
+        h.credit_line.repay(&h.borrower, &id, &(5 * PRICE_SCALE));
+        let booked = h.credit_line.owed(&id);
+        assert_eq!(booked.pending_fee, 0);
+        assert_eq!(booked.pending_interest, 0);
+        assert_eq!(booked.accrued_fee, 5 * PRICE_SCALE);
+        assert_eq!(booked.accrued_interest, 50 * PRICE_SCALE);
+        assert_eq!(booked.total, 555 * PRICE_SCALE);
+        assert_eq!(booked.total, h.credit_line.debt_of(&id));
+    }
+
+    #[test]
+    fn owed_needs_no_price_guard() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line
+            .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line
+            .draw(&h.borrower, &id, &(500 * PRICE_SCALE), &h.borrower.clone());
+        h.env
+            .ledger()
+            .set_timestamp(h.env.ledger().timestamp() + 365 * 24 * 60 * 60);
+
+        // Point the asset at an address with no contract: any PriceGuard call would trap.
+        h.credit_line.configure_asset(
+            &h.admin,
+            &h.asset,
+            &Address::generate(&h.env),
+            &h.token.address,
+            &0,
+            &MarginThresholds {
+                warning_bps: 7_000,
+                margin_call_bps: 8_000,
+                liquidation_bps: 9_000,
+            },
+        );
+        let owed = h.credit_line.owed(&id);
+        assert_eq!(owed.total, 550 * PRICE_SCALE);
+        assert_eq!(owed.pending_interest, 50 * PRICE_SCALE);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: unknown line")]
+    fn owed_panics_for_an_unknown_line() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        h.credit_line.owed(&999);
     }
 }
