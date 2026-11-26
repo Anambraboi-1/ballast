@@ -385,7 +385,16 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
   [Admin-set parameters that change settlement value](#admin-set-parameters-that-change-settlement-value).
 - Cash legs are not escrowed; each is pre-authorised with a token allowance granted in the call the
   paying party signs (see the module docs). One live proposal per (lender, token): a second
-  `propose` replaces the first one's allowance.
+  `propose` replaces the first one's allowance (`propose`).
+  **The borrower side is overwritten too.** SEP-41 `approve` replaces the (owner, spender)
+  allowance, so every `accept_and_settle` overwrites the borrower's leg-2 allowance
+  (`accept_and_settle`). It therefore approves the running sum of the borrower's outstanding leg-2
+  ceilings (`DataKey::BorrowerDue`) and never shortens the expiry (`accept_and_settle`, `write_borrower_due`), rather than
+  this trade's ceiling alone, which would strand every earlier trade's keeper or lender `unwind`.
+  The sum is released by `unwind` and `default_close` (`release_borrower_due`, called from `unwind` and `default_close`) but **not** by
+  `default_at_maturity`, so a trade defaulted at maturity stays counted and the next settle
+  approves more than the borrower owes. A closed trade's share also stays spendable in the live
+  allowance until the next settle or expiry (#843).
 - **Terms.** `propose` holds a trade's term, counted from the proposal to `maturity_at`, to its
   `kind`: 24h for intraday, 48h for overnight, 30 days for term and for open. It also refuses a
   `rate_bps` above 10,000 (100% a year). Both are checked before the lender's allowance is granted.
@@ -401,6 +410,37 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
   guarded price with no haircut, capped at the pledge; any remainder returns to the borrower. If the
   collateral is worth less than the exposure the lender takes all of it and bears the shortfall.
   No USDC moves on default.
+- **Margin and maturity semantics.** What each value and path actually means, and what follows:
+  - **`margin_call_amount` is a value shortfall, not a unit count.** `call_margin` sets it to
+    `max(0, exposure * 10_000 / margin_call_bps - collateral_value)`, where `collateral_value` is
+    already haircut (`call_margin`, valued by `evaluate_margin`). It is in USDC base
+    units (post-haircut), the same figure the `mcall` event carries. *Consequence:* the console and
+    notifications must not ask the borrower to top up this many RWA units; units needed are
+    `ceil(amount * PRICE_SCALE * 10_000 / (price * (10_000 - haircut_bps)))` at the current price.
+    The figure is only refreshed by `call_margin`: a partial `top_up` leaves it stale until the next
+    keeper tick (#847). Its exact value is asserted in `exact_margin_call_amount_computed_on_margin_call` (#203).
+  - **Exposure stops accruing at `maturity_at`.** `evaluate_margin` accrues interest from
+    `settled_at` to `min(now, maturity_at)` (`evaluate_margin`), so after maturity `margin_view.exposure`,
+    the `call_margin` shortfall and what `default_close` hands the lender all equal what `unwind`
+    collects (`total_due`). Before #218 there was no cap and post-maturity exposure
+    kept growing past anything `unwind` would charge. *Consequence:* there is no late interest; a
+    borrower who pays late owes the same as one who pays on time.
+  - **Non-payment at maturity is remedied by `default_at_maturity`, not `default_close`.**
+    `default_close` refuses without an open margin call ("no active margin call to default on"), so a borrower whose
+    collateral is still healthy at maturity and does not repay cannot be defaulted through it.
+    `default_at_maturity` (added for #26) covers that case: the lender or keeper may
+    call it once `now >= maturity_at + maturity_grace` (default 24h, admin-set with a 60s floor),
+    and it hands the lender `ceil(total_due / price)` units at the guarded price with no haircut,
+    capped at the pledge. *Consequence:* a lender's maturity remedy arrives no earlier than
+    `maturity_grace` after maturity, and nothing moves on its own; someone must call it. It does
+    not release the borrower's leg-2 due (see the cash-legs bullet above).
+  - **Neither default path acts without an `Ok` price.** `default_close` panics with "price is
+    not Ok, cannot default" when `evaluate_margin` returns `None`, and
+    `default_at_maturity` does the same; `call_margin` cannot open or clear a
+    call either ("price is not Ok, cannot evaluate margin"). There is no fallback to the last good price. *Consequence:*
+    while the guard is `Degraded` or `Halted` an expired cure window or a matured, unpaid trade
+    stays open and the lender carries the price risk until `risk` clears the halt
+    (`confirm_halt_cleared`) or the sources recover. Tests for these refusals are tracked in #237.
 - Yield on the pledged RWA during the term is not passed through.
 - **Asset configuration & timelock (#215).** An asset's first listing is applied immediately by the
   admin. Once configured, a change that could loosen risk (a new `price_guard`, a lower haircut, any
