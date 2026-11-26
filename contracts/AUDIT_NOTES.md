@@ -222,9 +222,6 @@ when its fix lands (#175).
 - **`initialize` is open to the first caller.** No contract checks who calls `initialize`, and
   deploy and `initialize` are separate transactions, so whoever initializes first sets every role;
   the deploy scripts detect this only by reading `roles` back afterwards. No tracking issue yet.
-- **No storage TTL extension in ExitDesk.** Its instance config, inventory and daily-cap entries
-  are never extended, so they can be archived after the network's minimum TTL and need a restore
-  before the desk works again. The other contracts now extend on use. Tracked in #208.
 - **No upgrade path outside Registry and PriceGuard.** CreditLine, PledgeVault, ExitDesk and
   RepoDvp have no upgrade entry point, so a fix to any of them means a new deployment and moving
   live state across. RepoDvp and ExitDesk are tracked in #837; CreditLine and PledgeVault have no
