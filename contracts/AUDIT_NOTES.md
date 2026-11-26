@@ -277,13 +277,20 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
   seized (`record.seized_units > 0 || state.pledged_units > 0`), and succeeds only for uncollateralized
   lines with zero seized units.
 - **`close_liquidated`** (lender-signed) verifies that collateral has cleared the vault, values the
-  collateral at the *frozen* price with no haircut, pays any surplus from the lender's USDC to the
-  borrower in the same call, records any shortfall, writes unrecovered principal off `funded` and
-  closes the line. The lender cannot choose the price, understate the collateral, or close while
-  collateral remains in the vault, but **can choose when to close**; until they do the line stays
-  `Liquidating` and the borrower's surplus is not paid. There is no borrower-side or keeper-side close of a *liquidated* line. A fully repaid `Open` line
+  collateral at the *frozen* price with no haircut, books any surplus as a borrower claim, records
+  any shortfall, writes unrecovered principal off `funded` and closes the line. The lender cannot
+  choose the price, understate the collateral, or close while collateral remains in the vault, but
+  **can choose when to close**; until they do the line stays `Liquidating`. There is no borrower-side or keeper-side close of a *liquidated* line. A fully repaid `Open` line
   (no principal, interest, fee or funding left) can be closed by its lender or borrower with
   `close`; `close` refuses a `Liquidating` line, so it cannot bypass `close_liquidated` (#130).
+- **The surplus is a pull payment (#149).** `close_liquidated` moves no USDC: a positive surplus is
+  booked in `SurplusOwed(line)` and the borrower pulls it with `claim_surplus`, which uses an
+  allowance the lender granted this contract on the USDC token and `transfer_from`. A lender with an
+  insufficient balance can therefore still close. The claim is zeroed before the transfer, so it
+  pays out at most once, and a failed transfer reverts and leaves it recorded. Break-even and
+  shortfall closes record nothing. **Limit:** the contract cannot make the lender fund the claim;
+  until the lender approves and holds the amount, the borrower's claim stays outstanding and
+  visible through `surplus_owed(line)`. The keeper job is unaffected (it never closes lines).
 - **Lender withdrawals** exist because without them repaid principal and interest were locked in
   the contract. `withdraw_undrawn` returns committed USDC that is not out on loan (reducing
   `funded`); `withdraw_interest` returns repaid interest, tracked separately in `Claimable(line)`.
