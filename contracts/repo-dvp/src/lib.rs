@@ -1341,6 +1341,54 @@ impl RepoDvp {
             .publish((symbol_short!("topup"), id), (extra_units, cured));
     }
 
+    /// The cash borrower takes back `units` of collateral from a settled trade that is
+    /// over-collateralised (PRD Phase 3 variation margin in the borrower's favour, #212). Refused
+    /// while a margin call is open, on a price that is not usable for new risk, while `Repos` is
+    /// paused (releasing collateral adds risk), or if the LTV after the release would reach
+    /// `warning_bps`. The post-release position is valued exactly as `call_margin` values it
+    /// (`evaluate_margin`: interest accrued to now, capped at maturity).
+    pub fn release_excess(env: Env, cash_borrower: Address, id: u64, units: i128) {
+        cash_borrower.require_auth();
+        ttl::extend_instance(&env);
+        pause::require_not_paused(&env, &PauseScope::Repos);
+        assert!(units > 0, "repo-dvp: release amount must be positive");
+
+        let mut trade = read_trade(&env, id);
+        assert_eq!(trade.status, RepoStatus::Settled, "repo-dvp: trade is not settled");
+        assert_eq!(
+            trade.cash_borrower, cash_borrower,
+            "repo-dvp: only the cash borrower can release excess"
+        );
+        assert!(
+            !trade.pending_margin_call,
+            "repo-dvp: cannot release with an open margin call"
+        );
+        assert!(
+            units < trade.units,
+            "repo-dvp: cannot release all collateral"
+        );
+
+        let config = read_asset_config(&env, &trade.asset);
+        let mut after = trade.clone();
+        after.units = trade.units - units;
+        let (exposure, collateral_value, _, _) =
+            evaluate_margin(&env, &after, &config).expect("repo-dvp: price is not usable");
+        assert!(
+            risk::ltv_bps(exposure, collateral_value) < config.thresholds.warning_bps,
+            "repo-dvp: post-release LTV exceeds warning threshold"
+        );
+
+        trade.units = after.units;
+        write_trade(&env, &trade);
+        token::Client::new(&env, &trade.asset).transfer(
+            &env.current_contract_address(),
+            to_muxed(&cash_borrower),
+            &units,
+        );
+        env.events()
+            .publish((symbol_short!("release"), id), units);
+    }
+
     /// If the cash borrower has not cured an outstanding margin call by `cure_deadline`, the cash
     /// lender takes title to as much of the pledged RWA as covers what is owed and the trade
     /// closes. See the module docs for exactly what bookkeeping this does and does not do.

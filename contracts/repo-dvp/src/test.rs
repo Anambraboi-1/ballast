@@ -2806,6 +2806,173 @@ mod storage_lifetime {
             assert_eq!(data.1, 7_200);
         }
     }
+
+    #[test]
+    fn release_excess_happy_path_reduces_units_and_transfers_tokens() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        let h = setup();
+        // 50 cash against 100 units at $1 with a 5% haircut: about 53% LTV (warning 70%).
+        let id = proposed(&h, 3_600);
+        settle(&h, id);
+
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        let borrower_before = MockTokenClient::new(&h.env, &h.rwa).balance(&h.cash_borrower);
+
+        // Price doubles to $2.00
+        MockPriceGuardClient::new(&h.env, &h.price_guard).set_price(
+            &h.rwa,
+            &(2 * PRICE_SCALE),
+            &PriceStatus::Ok,
+            &h.env.ledger().timestamp(),
+        );
+
+        // Release 40 units (100 -> 60 remaining).
+        // 60 units * $2 * 0.95 = $114 collateral value against ~50 exposure => LTV ~43.8% < 70%.
+        let release_amt = 40 * PRICE_SCALE;
+        repo.release_excess(&h.cash_borrower, &id, &release_amt);
+
+        // Verify event (symbol_short!("release"), id), release_amt immediately before subsequent calls reset event log
+        let all_events = h.env.events().all();
+        let events = all_events.filter_by_contract(&h.repo);
+        let items = events.events();
+        let last = items.last().expect("must have event");
+        let body = match &last.body {
+            soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+        };
+        let topic0 = Symbol::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+        )
+        .unwrap();
+        let topic1 = u64::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.topics[1]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(topic0, symbol_short!("release"));
+        assert_eq!(topic1, id);
+        let data: i128 = TryFromVal::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(data, release_amt);
+
+        let trade = repo.trade(&id);
+        assert_eq!(trade.units, 60 * PRICE_SCALE);
+        assert_eq!(
+            MockTokenClient::new(&h.env, &h.rwa).balance(&h.cash_borrower) - borrower_before,
+            release_amt
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "repo-dvp: price is not usable")]
+    fn release_excess_refused_on_unusable_price() {
+        let h = setup();
+        let id = proposed(&h, 3_600);
+        settle(&h, id);
+
+        MockPriceGuardClient::new(&h.env, &h.price_guard).set_price(
+            &h.rwa,
+            &PRICE_SCALE,
+            &PriceStatus::Degraded,
+            &h.env.ledger().timestamp(),
+        );
+
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.release_excess(&h.cash_borrower, &id, &(10 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "repo-dvp: cannot release with an open margin call")]
+    fn release_excess_refused_with_open_margin_call() {
+        let h = setup();
+        let id = settled_under_margin(&h);
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.call_margin(&h.keeper, &id);
+        assert!(repo.trade(&id).pending_margin_call);
+
+        repo.release_excess(&h.cash_borrower, &id, &(10 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "repo-dvp: post-release LTV exceeds warning threshold")]
+    fn release_excess_refused_when_post_ltv_reaches_or_exceeds_warning() {
+        let h = setup();
+        // 50 cash against 100 units at $1 with 5% haircut => LTV ~52.6%, warning is 70% (7_000 bps).
+        // If borrower tries to release 30 units, rem = 70 => post collateral = 66.5, LTV = 50 / 66.5 = 75.18% >= 70%.
+        let id = proposed(&h, 3_600);
+        settle(&h, id);
+
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.release_excess(&h.cash_borrower, &id, &(30 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "repo-dvp: only the cash borrower can release excess")]
+    fn release_excess_refused_for_non_borrower() {
+        let h = setup();
+        let id = proposed(&h, 3_600);
+        settle(&h, id);
+
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.release_excess(&h.cash_lender, &id, &(10 * PRICE_SCALE));
+    }
+
+    #[test]
+    #[should_panic(expected = "repo-dvp: trade is not settled")]
+    fn release_excess_refused_on_unsettled_trade() {
+        let h = setup();
+        let id = proposed(&h, 3_600);
+
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.release_excess(&h.cash_borrower, &id, &(10 * PRICE_SCALE));
+    }
+
+    /// Settled 50 cash against 100 units at $1 with a 5% haircut, so the post-release LTV is
+    /// `50e7 * 10_000 / (remaining * 0.95)`, floored. 751_800_000 units remaining value at
+    /// 714_210_000, which is exactly 7_000 bps: the warning threshold, so refused (#212).
+    #[test]
+    #[should_panic(expected = "repo-dvp: post-release LTV exceeds warning threshold")]
+    fn release_excess_refused_when_post_ltv_lands_exactly_on_warning() {
+        let h = setup();
+        let id = proposed(&h, 3_600);
+        settle(&h, id);
+        RepoDvpClient::new(&h.env, &h.repo).release_excess(
+            &h.cash_borrower,
+            &id,
+            &(UNITS - 751_800_000),
+        );
+    }
+
+    /// 752_000_000 units remaining value at 714_400_000: 6_998 bps, one step under warning.
+    #[test]
+    fn release_excess_allowed_just_under_warning() {
+        let h = setup();
+        let id = proposed(&h, 3_600);
+        settle(&h, id);
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.release_excess(&h.cash_borrower, &id, &(UNITS - 752_000_000));
+        assert_eq!(repo.trade(&id).units, 752_000_000);
+        assert_eq!(repo.margin_view(&id).ltv_bps, 6_998);
+    }
+
+    /// Releasing collateral adds risk, so it stops with new repo activity when `Repos` is paused.
+    #[test]
+    fn release_excess_is_refused_while_repos_are_paused() {
+        let h = setup();
+        let id = proposed(&h, 3_600);
+        settle(&h, id);
+        let repo = RepoDvpClient::new(&h.env, &h.repo);
+        repo.pause(&h.pauser, &PauseScope::Repos);
+        assert!(repo
+            .try_release_excess(&h.cash_borrower, &id, &PRICE_SCALE)
+            .is_err());
+        assert_eq!(repo.trade(&id).units, UNITS);
+    }
 }
 
 /// Contract event assertions serving as the formal contract between RepoDvp and off-chain

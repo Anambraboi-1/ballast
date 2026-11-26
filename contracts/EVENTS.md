@@ -132,6 +132,7 @@ longer pause names use `Symbol::new`. Both decode to the same plain string in `c
 | `mcall` | `id: u64` | `margin_call_amount: i128` (bare value) | `call_margin` (keeper) | Position at `MarginCall` or worse. Emitted on every such call, including repeats that only update the amount; the cure deadline does not move |
 | `cured` | `id: u64` | `0: i128` (always zero) | `call_margin` (keeper) | A call was open and the position is back under the margin-call threshold (the price recovered) |
 | `topup` | `id: u64` | `(extra_units: i128, cured: bool)` | `top_up` (cash borrower; not pause-gated) | Borrower added collateral. `cured` is true when this cleared an open call |
+| `release` | `id: u64` | `units: i128` (bare value) | `release_excess` (cash borrower; refused while `Repos` is paused) | Borrower took back `units` of excess collateral; the post-release LTV is under `warning_bps` |
 | `default` | `id: u64` | `(lender_units: i128, borrower_units: i128)` | `default_close` (keeper) | Cure deadline passed without a cure: lender takes `lender_units`, the rest goes back to the borrower |
 | `mat_def` | `id: u64` | `(lender_units: i128, borrower_units: i128)` | `default_at_maturity` (cash lender or keeper) | Leg 2 not repaid by `maturity_at + maturity_grace`; same split as `default` |
 | `usdc` | none (topic is the 1-tuple `(Symbol,)`) | `(old_usdc: Option<Address>, new_usdc: Address)` | `set_usdc` (admin) | Cash-leg token set or changed; `old_usdc` is `None` on the first call |
