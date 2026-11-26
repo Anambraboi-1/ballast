@@ -61,6 +61,7 @@ consumer changes and a redeploy, and this file has to be updated in the same PR.
 | `asset_configured` | `asset: Address` | `(price_guard: Address, usdc: Address, haircut_bps: u32, thresholds: MarginThresholds)` | `configure_asset` (admin) | indexer (stored only) |
 | `vault_set` | none (topic is the 1-tuple `(Symbol,)`) | `vault: Address` (bare value, not a tuple) | `set_vault` (admin) | indexer (stored only) |
 | `collateral_synced` | `line: u64` | `(asset: Address, units: i128, source: Symbol)` | `sync_from_vault` (`source = "vault"`), `sync_collateral` (`source = "keeper"` or `"admin"`) | indexer (stored only) |
+| `line_funded` | `line: u64` | `(lender: Address, amount: i128, funded_total: i128)` | `fund` (lender) | indexer (stored only) |
 | `drawn` | `line: u64` | `(amount: i128, to: Address, drawn_total: i128, ltv_bps: u32)` | `draw` (borrower) | indexer (stored only) |
 | `repaid` | `line: u64` | `(payer: Address, interest_paid: i128, principal_paid: i128, drawn_after: i128)` | `repay` (any payer) | indexer (stored only) |
 | `margin_state_changed` | `line: u64` | `(from: MarginState, to: MarginState, ltv_bps: u32, price: i128)` | `poke`, only when the state changes | indexer (stored only) |
@@ -83,7 +84,7 @@ Field notes:
 - `line_closed`: `recovered = seized_units * price` with no haircut. Then either `surplus > 0` or
   `shortfall > 0`, or both are zero.
 
-`open` and `fund` publish no events today (see planned events below).
+`open` publishes no event today (see planned events below).
 
 ## PledgeVault (`contracts/pledge-vault`)
 
@@ -227,7 +228,6 @@ contract.
 | Contract | Topic | Topic arguments | Proposed payload | Emitter | Issue |
 |---|---|---|---|---|---|
 | CreditLine | `line_opened` | `line: u64` | `(lender: Address, borrower: Address, asset: Address, limit: i128, rate_bps: u32, cure_s: u64)` | `open` | #138 |
-| CreditLine | `line_funded` | `line: u64` | `(lender: Address, amount: i128, funded_total: i128)` | `fund` | #137 |
 | CreditLine | not named yet | `line: u64` | not specified | `reduce_limit` (new) | #813 |
 | RepoDvp | `mcall` (**breaking**: bare value becomes a tuple) | `id: u64` | `(margin_call_amount: i128, exposure: i128, ltv_bps: u32, price: i128, cure_deadline: u64)` | `call_margin` | #840 |
 | RepoDvp | `cured` (**breaking**: `0i128` becomes a tuple) | `id: u64` | `(exposure: i128, ltv_bps: u32, price: i128)` | `call_margin` | #840 |

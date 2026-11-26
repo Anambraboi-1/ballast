@@ -83,7 +83,7 @@
 //! the debt visible and collectable, but it cannot force a lender to fund it.
 //!
 //! **Events.** Like `PledgeVault`, state changes publish one event with the shape
-//! `((Symbol, line), payload)`: `drawn` from `draw`, `repaid` from `repay`, `line_closed` from
+//! `((Symbol, line), payload)`: `line_funded` from `fund`, `drawn` from `draw`, `repaid` from `repay`, `line_closed` from
 //! `close_liquidated`, `surplus_claimed` from `claim_surplus` and `undrawn_withdrawn` from
 //! `withdraw_undrawn` (which moves the lender's
 //! funded exposure and so needs an on-chain trace for the console and indexer). See `README.md`'s
@@ -639,6 +639,10 @@ impl CreditLine {
 
     /// Funds the line with USDC that sits here, undrawn, until `draw` pulls it out (PRD §6.2:
     /// "USDC in transit only").
+    ///
+    /// Publishes `(Symbol("line_funded"), line)` with `(lender, amount, funded_total)` after the
+    /// state write, so a lender or indexer can reconcile deposits without cross-referencing USDC
+    /// transfer events (#137). A reverted call publishes nothing.
     pub fn fund(env: Env, lender: Address, line: u64, amount: i128) {
         ttl::extend_instance(&env);
         lender.require_auth();
@@ -660,6 +664,11 @@ impl CreditLine {
 
         state.funded += amount;
         write_line(&env, line, &state);
+
+        env.events().publish(
+            (Symbol::new(&env, "line_funded"), line),
+            (lender, amount, state.funded),
+        );
     }
 
     /// Names the `PledgeVault` allowed to report collateral through `sync_from_vault`. Admin only.
@@ -4842,4 +4851,123 @@ mod test {
             b.credit_line.surplus_owed(&idb)
         );
     }
+
+    // --- line_funded (#137) -----------------------------------------------------------------
+
+    #[test]
+    fn fund_publishes_line_funded_event_on_success_and_none_on_failure() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
+        let agreement = BytesN::from_array(&h.env, &[7u8; 32]);
+        let id = h.credit_line.open(
+            &h.lender,
+            &h.borrower,
+            &h.asset,
+            &(1_000 * PRICE_SCALE),
+            &1_000,
+            &0,
+            &86_400,
+            &agreement,
+        );
+
+        // Failure: zero amount fails and emits no event.
+        assert!(h.credit_line.try_fund(&h.lender, &id, &0).is_err());
+        assert!(h
+            .env
+            .events()
+            .all()
+            .filter_by_contract(&h.credit_line.address)
+            .events()
+            .is_empty());
+
+        // Failure: non-lender caller fails and emits no event.
+        let stranger = Address::generate(&h.env);
+        assert!(h
+            .credit_line
+            .try_fund(&stranger, &id, &(100 * PRICE_SCALE))
+            .is_err());
+        assert!(h
+            .env
+            .events()
+            .all()
+            .filter_by_contract(&h.credit_line.address)
+            .events()
+            .is_empty());
+
+        // Success: fund the line
+        let fund_amount = 400 * PRICE_SCALE;
+        h.token.mint(&h.lender, &fund_amount);
+        h.credit_line.fund(&h.lender, &id, &fund_amount);
+
+        let events = h
+            .env
+            .events()
+            .all()
+            .filter_by_contract(&h.credit_line.address);
+        let items = events.events();
+        assert_eq!(items.len(), 1);
+        let body = match &items[0].body {
+            soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+        };
+        let topic0 = Symbol::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.topics[0]).unwrap(),
+        )
+        .unwrap();
+        let topic1 = u64::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.topics[1]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(topic0, Symbol::new(&h.env, "line_funded"));
+        assert_eq!(topic1, id);
+
+        let data: (Address, i128, i128) = TryFromVal::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(data, (h.lender.clone(), fund_amount, 400 * PRICE_SCALE));
+
+        // Success: fund a second time, payload reflects accumulated funded_total
+        let fund_amount_2 = 600 * PRICE_SCALE;
+        h.token.mint(&h.lender, &fund_amount_2);
+        h.credit_line.fund(&h.lender, &id, &fund_amount_2);
+
+        let events2 = h
+            .env
+            .events()
+            .all()
+            .filter_by_contract(&h.credit_line.address);
+        let items2 = events2.events();
+        assert_eq!(items2.len(), 1);
+        let body2 = match &items2[0].body {
+            soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+        };
+        let topic0_2 = Symbol::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body2.topics[0]).unwrap(),
+        )
+        .unwrap();
+        let topic1_2 = u64::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body2.topics[1]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(topic0_2, Symbol::new(&h.env, "line_funded"));
+        assert_eq!(topic1_2, id);
+
+        let data2: (Address, i128, i128) = TryFromVal::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body2.data).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            data2,
+            (h.lender.clone(), fund_amount_2, 1_000 * PRICE_SCALE)
+        );
+    }
+
 }

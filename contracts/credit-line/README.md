@@ -77,6 +77,7 @@ and the payload-order compatibility rule.
 |---|---|---|---|
 | `drawn` | `(Symbol("drawn"), line: u64)` | `(amount: i128, to: Address, drawn_total: i128, ltv_bps: u32)` | `draw` |
 | `repaid` | `(Symbol("repaid"), line: u64)` | `(payer: Address, interest_paid: i128, principal_paid: i128, drawn_after: i128)` | `repay` |
+| `line_funded` | `(Symbol("line_funded"), line: u64)` | `(lender: Address, amount: i128, funded_total: i128)` | `fund` |
 | `undrawn_withdrawn` | `(Symbol("undrawn_withdrawn"), line: u64)` | `(lender: Address, amount: i128, funded_after: i128)` | `withdraw_undrawn` |
 | `line_closed` | `(Symbol("line_closed"), line: u64)` | `(debt: i128, recovered: i128, surplus: i128, shortfall: i128)` | `close_liquidated`, `close_expired` |
 | `surplus_claimed` | `(Symbol("surplus_claimed"), line: u64)` | `(borrower: Address, lender: Address, amount: i128)` | `claim_surplus` |
@@ -87,6 +88,10 @@ and the payload-order compatibility rule.
 | `margin_state_changed` | `(Symbol("margin_state_changed"), line: u64)` | `(from: MarginState, to: MarginState, ltv_bps: u32, price: i128)` | `poke` |
 | `asset_configured` | `(Symbol("asset_configured"), asset: Address)` | `(price_guard: Address, usdc: Address, haircut_bps: u32, thresholds: MarginThresholds)` | `configure_asset` |
 | `vault_set` | `(Symbol("vault_set"),)` | `vault: Address` | `set_vault` |
+
+`line_funded` is published after the state write, so `funded_total` is the line's `funded`
+figure once the deposit has been applied (`funded_before + amount`). A reverted funding
+publishes nothing.
 
 `undrawn_withdrawn` is published after the state write, so `funded_after` is the line's `funded`
 figure once the withdrawal has been applied (`funded_before - amount`). A reverted withdrawal
