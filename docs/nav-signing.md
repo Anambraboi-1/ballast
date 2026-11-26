@@ -100,7 +100,9 @@ stellar contract invoke \
 ```
 
 ### 3. Require NAV Signatures (Admin only)
-Enabling signature verification takes effect immediately:
+The requirement is per asset (#95) and defaults to `true` for an asset that was never configured.
+Enabling it takes effect immediately; turning it off once the asset has accepted a reading goes
+through `queue_config` and the 48h timelock:
 ```bash
 stellar contract invoke \
   --id "$PRICE_GUARD_CID" \
@@ -108,6 +110,7 @@ stellar contract invoke \
   --network "$NETWORK" \
   -- configure_signature_requirement \
   --admin "$ADMIN" \
+  --asset "$RWA_SAC" \
   --required true
 ```
 

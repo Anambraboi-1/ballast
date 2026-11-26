@@ -191,8 +191,8 @@ all six contracts against the public Stellar testnet.
 
 ## `price-guard`'s `publish_nav` — issuer-signature verification (breaking ABI change)
 
-`PriceGuard.publish_nav` takes an additional `asset_code: Bytes` argument (the asset's ticker,
-e.g. `"SPIKO"`, as raw UTF-8 bytes — see the crate's module doc comment) and, when the contract's
+`PriceGuard.publish_nav` now takes an additional `asset_code: Bytes` argument (the asset's ticker,
+e.g. `"SPIKO"`, as raw UTF-8 bytes — see the crate's module doc comment) and, when the asset's
 `require_nav_signature` flag is `true` (the default), verifies `sig` against the asset's registered
 issuer key (`configure_issuer_key`, admin-only) over the canonical message
 `"{asset_code}:{ts}:{value}"`, via `env.crypto().ed25519_verify(...)`.
@@ -228,16 +228,57 @@ This was a breaking change to `publish_nav`'s call signature. Both `scripts/depl
 `scripts/e2e-smoke.sh` have since been updated for it (verified against a real testnet deployment
 — see `TESTNET_DEPLOYMENT.md`):
 
-- `scripts/deploy.sh` calls `configure_signature_requirement --admin ... --required false` right
-  after `configure_asset` for `price-guard`, since the smoke-test deploy registers no real issuer
-  key for its test `RWA1` asset.
-- `scripts/e2e-smoke.sh`'s `publish_nav` call now passes `--asset_code` (the hex-encoded UTF-8
-  bytes of `"RWA1"`) alongside the existing `ZERO_SIG` placeholder.
+- `scripts/e2e-smoke.sh`'s `publish_nav` call passes `--asset_code` (the hex-encoded UTF-8 bytes
+  of `"RWA1"`) and a real signature from `scripts/sign-nav.mjs`.
 
-`require_nav_signature` defaults to `true` on a fresh deploy (see the crate's module doc comment on
-why this flag exists — it's a local-testing/bring-up affordance, not a security control) — a real
-testnet/mainnet deploy should call `configure_issuer_key` for every asset before flipping it on if
-it was ever turned off, and should leave it at its default `true` otherwise.
+### Per-asset signature requirement (breaking ABI change, #95)
+
+The signature requirement is kept per asset, not per contract, so disabling it for a test asset
+leaves every other asset on the same PriceGuard signature-checked:
+
+- `configure_signature_requirement(admin, asset, required)` (CLI: `--admin ... --asset <Address>
+  --required true|false`), `require_nav_signature(asset) -> bool` and
+  `ConfigChange::RequireNavSignature(asset, required)` all name the asset. The old one-argument
+  global forms are gone.
+- `require_nav_signature(asset)` is `true` for an asset that was never configured (see the crate's
+  module doc comment on why this flag exists — it's a local-testing/bring-up affordance, not a
+  security control). A real testnet/mainnet deploy should call `configure_issuer_key` for every
+  asset before turning it on if it was ever turned off, and should leave it at `true` otherwise.
+- Requiring signatures applies at once. Disabling them applies at once only during bring-up, while
+  the asset has no stored flag and no reading was ever published for it. After that, turning off a
+  requirement in force panics with `price-guard: disabling signature requirement must be queued via
+  queue_config`, and has to be queued with `queue_config` and executed after the 48h timelock.
+- `scripts/configure-nav-key.sh` (run by `scripts/deploy.sh` and `scripts/redeploy-price-guard.sh`)
+  sets it to `true` for `RWA1`, and `scripts/deploy-mainnet-prices.sh` sets it to `true` for every
+  asset it registers.
+
+### Storage layout and migration (#96) — requires a redeploy
+
+`PriceGuard` keeps every per-asset entry (`Config`, `Source`, `SourceNames`, `NavRecord`,
+`LastGood`, `RollingReference`, `RollingReferenceUpdated`, `Halted`, `PendingHaltValue`,
+`IssuerPubKey`, `RequireNavSignature`, `LastStatus`) in persistent storage, one entry per key, with
+the TTL extended (`ttl::extend_persistent`) whenever it is read or written. The instance entry,
+which every publish and every consumer's `guarded_price` loads, holds only the roles, a pending
+admin transfer and the timelock id counter, so its size no longer grows with the number of assets.
+
+Earlier builds kept these keys in instance storage. The new code never reads them there, so this
+change **requires a fresh PriceGuard deploy**; do not move an existing contract onto it with
+`queue_upgrade`/`execute_upgrade`. After such an upgrade every asset would read as unconfigured
+(`publish_*` and `guarded_price` panic with `price-guard: asset not configured`), and re-running
+`configure_asset` would bring the asset back with no `LastGood` baseline, no `Halted` latch and no
+issuer key, so a halted asset would silently stop being halted.
+
+To migrate an existing deployment:
+
+- Testnet/local: run `scripts/redeploy-price-guard.sh [network]`. It deploys and initializes a new
+  PriceGuard, configures `RWA1`, registers the NAV attestor key and requires signatures
+  (`scripts/configure-nav-key.sh`), and repoints PledgeVault, CreditLine, ExitDesk and RepoDvp at it.
+- Any other asset on the old contract: run `configure_asset`, `configure_issuer_key` and
+  `configure_signature_requirement --required true` for it on the new contract, and repoint each
+  consumer's `configure_asset` at the new id.
+- The price history (`LastGood`, rolling reference, status) is rebuilt by the next publishes. If an
+  asset was halted on the old contract, resolve that halt before switching, because the new
+  contract starts without the latch.
 
 ## Rotating the price publisher without redeploying
 
@@ -266,7 +307,7 @@ stellar contract invoke --id "$PRICE_GUARD_CID" --network testnet --source admin
 stellar contract invoke --id "$PRICE_GUARD_CID" --network testnet --source admin -- \
   configure_issuer_key --admin "$ADMIN" --asset "$RWA_SAC" --issuer_pubkey "$NEW_PUBLISHER_KEY_HEX"
 stellar contract invoke --id "$PRICE_GUARD_CID" --network testnet --source admin -- \
-  configure_signature_requirement --admin "$ADMIN" --required true
+  configure_signature_requirement --admin "$ADMIN" --asset "$RWA_SAC" --required true
 ```
 
 Update `PRICE_PUBLISHER` in `.env.<network>-deploy` before re-running
@@ -338,7 +379,7 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
 | `execute_upgrade` | Anyone | 48h after queue | Intended | Applies bytecode upgrade after the 48h delay has elapsed. |
 | `configure_asset` | Admin | Dynamic | Intended | Initial asset onboarding and tightening safety bands (narrower price band, shorter max staleness) take effect immediately to enhance security. Loosening bands requires 48h timelock via `queue_config` to prevent stealth weakening of outlier defenses. |
 | `configure_issuer_key` | Admin | Dynamic | Intended | Initial attestor key registration is immediate for onboarding. Rotating an existing attestor key requires 48h timelock via `queue_config` to prevent immediate hijacking of the NAV signer. |
-| `configure_signature_requirement` | Admin | Dynamic | Intended | Requiring signatures (`required = true`) strengthens security and takes effect immediately. Turning an existing requirement off (`true` → `false`) relaxes security and must go through the 48h timelock via `queue_config`. Exception: if the flag has never been set, the first call applies immediately even with `required = false` (`contracts/price-guard/src/lib.rs`, `configure_signature_requirement`). |
+| `configure_signature_requirement` | Admin | Dynamic | Intended | Per asset since #95 (`configure_signature_requirement(admin, asset, required)`), so one transaction cannot switch checks off for every asset; an asset never configured defaults to `true`. Requiring signatures (`required = true`) takes effect immediately. Turning a requirement off relaxes security and must go through the 48h timelock via `queue_config(RequireNavSignature(asset, false))`. Exception: while an asset is being brought up (flag never set and no reading published yet), `required = false` applies immediately. |
 | `configure_source` | Admin | Immediate | Intended | Source allowlist (#84): `publish_source` rejects any name not enabled for the asset, so one feed cannot be counted twice under two spellings. Enabling or disabling a name applies at once and re-evaluates the price; `issuer` is reserved for `publish_nav`. |
 | `remove_source` | Admin | Immediate | Intended | Drops a source's reading, its allowlist entry and any staleness override at once, so an exploited, manipulated or failing feed stops counting in the median immediately. |
 | `configure_source_staleness` | Admin | Dynamic | Intended | Per-source staleness window (#86). Tightening (a positive window no larger than the source's current one) applies immediately. Widening a window or clearing an override keeps old readings counting for longer, so it requires the 48h timelock via `queue_config(SourceMaxStaleness)`. |
@@ -353,7 +394,7 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
 
 ## Timelocked contract upgrades (`Registry` and `PriceGuard`)
 
-`Registry` and `PriceGuard` implement timelocked in-place contract upgrades (`ballast_common::upgrade`) using Soroban's `env.deployer().update_current_contract_wasm(...)`. This enables upgrading contract logic and storage layouts without losing deployed state (`LastGood`, configured assets, latches, haircut configs) and avoids rewiring all six protocol contracts.
+`Registry` and `PriceGuard` implement timelocked in-place contract upgrades (`ballast_common::upgrade`) using Soroban's `env.deployer().update_current_contract_wasm(...)`. This enables upgrading contract logic and storage layouts without losing deployed state (`LastGood`, configured assets, latches, haircut configs) and avoids rewiring all six protocol contracts. A new build only keeps that state if it reads the same keys from the same storage type; the PriceGuard per-asset storage move (#96) does not, and needs a redeploy instead (see above).
 
 ### Upgrade Procedure
 

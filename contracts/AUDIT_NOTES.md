@@ -64,7 +64,7 @@ no timelock, and applies to positions that are already open.
 | PriceGuard | `remove_source` | a source name | which sources the median uses | none |
 | PriceGuard | `configure_source` | a source name and `enabled` | which names `publish_source` accepts and the median counts (the allowlist, #84); `issuer` is reserved for `publish_nav` | none |
 | PriceGuard | `configure_source_staleness`, `queue_config` | per-source staleness window | how long a source's reading keeps counting in the median (#86) | tightening immediate; widening or clearing 48h via `queue_config` |
-| PriceGuard | `configure_signature_requirement` | NAV signature on/off | whether unsigned NAV is accepted | turning it on immediate; turning it off 48h via `queue_config` |
+| PriceGuard | `configure_signature_requirement` | per-asset NAV signature on/off (#95) | whether unsigned NAV is accepted for that asset | turning it on immediate; turning it off 48h via `queue_config`, except while the asset is being brought up |
 | Registry | `queue_param` | haircuts and other asset params | Registry's own asset parameters (the contracts above read their own config, not Registry's) | 48h |
 
 The timelock column should be updated as #215 lands, along with any RepoDvp `set_usdc`
@@ -119,7 +119,7 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
 | `execute_upgrade` | Anyone | 48h after queue | Intended | Applies bytecode upgrade after the 48h delay has elapsed. |
 | `configure_asset` | Admin | Dynamic | Intended | Initial asset onboarding and tightening safety bands (narrower price band, shorter max staleness) take effect immediately to enhance security. Loosening bands requires 48h timelock via `queue_config` to prevent stealth weakening of outlier defenses. |
 | `configure_issuer_key` | Admin | Dynamic | Intended | Initial attestor key registration is immediate for onboarding. Rotating an existing attestor key requires 48h timelock via `queue_config` to prevent immediate hijacking of the NAV signer. |
-| `configure_signature_requirement` | Admin | Dynamic | Intended | Requiring signatures (`required = true`) strengthens security and takes effect immediately. Turning an existing requirement off (`true` → `false`) relaxes security and must go through the 48h timelock via `queue_config`. Exception: if the flag has never been set, the first call applies immediately even with `required = false` (`contracts/price-guard/src/lib.rs`, `configure_signature_requirement`). |
+| `configure_signature_requirement` | Admin | Dynamic | Intended | Per asset since #95 (`configure_signature_requirement(admin, asset, required)`), so one transaction cannot switch checks off for every asset; an asset never configured defaults to `true`. Requiring signatures (`required = true`) takes effect immediately. Turning a requirement off relaxes security and must go through the 48h timelock via `queue_config(RequireNavSignature(asset, false))`. Exception: while an asset is being brought up (flag never set and no reading published yet), `required = false` applies immediately. |
 | `configure_source` | Admin | Immediate | Intended | Source allowlist (#84): `publish_source` rejects any name not enabled for the asset, so one feed cannot be counted twice under two spellings. Enabling or disabling a name applies at once and re-evaluates the price; `issuer` is reserved for `publish_nav`. |
 | `remove_source` | Admin | Immediate | Intended | Drops a source's reading, its allowlist entry and any staleness override at once, so an exploited, manipulated or failing feed stops counting in the median immediately. |
 | `configure_source_staleness` | Admin | Dynamic | Intended | Per-source staleness window (#86). Tightening (a positive window no larger than the source's current one) applies immediately. Widening a window or clearing an override keeps old readings counting for longer, so it requires the 48h timelock via `queue_config(SourceMaxStaleness)`. |
@@ -247,6 +247,17 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
   issuers publish unsigned data. The attestor key is the same key that is authorised to publish, so
   on-chain the signature adds no protection against a compromised publisher: it records who relayed
   the value. Do not describe it as issuer attestation.
+- **The NAV signature requirement is per asset** (`DataKey::RequireNavSignature(asset)`, `true`
+  when unset). Turning it off for one asset leaves the others checked. Turning it on is immediate;
+  turning it off is immediate only during an asset's bring-up (no flag stored and no reading ever
+  published for it), and otherwise must go through `queue_config` and the 48h timelock. The deploy
+  scripts set it to `true` explicitly for every asset they configure.
+- **Per-asset state is in persistent storage**, one entry per key with its TTL extended on every
+  read and write; the instance entry holds only the roles, a pending admin transfer and the
+  timelock id counter, so it does not grow with the asset count. This moved the keys out of
+  instance storage and **requires a fresh PriceGuard deploy**: an in-place `execute_upgrade` would
+  leave every asset unconfigured and, once reconfigured, without its `LastGood` baseline, `Halted`
+  latch or issuer key. See `contracts/README.md`.
 - Roles rotate in place: `price_publisher` and the other non-admin roles go through
   `queue_role_change` / `execute_role_change` (48h), while the admin moves with the two-step
   `propose_admin` / `accept_admin` pair. A publisher rotation preserves `LastGood`, a `Halted` latch,
