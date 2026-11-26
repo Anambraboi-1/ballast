@@ -54,7 +54,7 @@ no timelock, and applies to positions that are already open.
 | PledgeVault | `configure_asset` | `credit_line` | the contract the vault asks for debt, borrower and LTV before `release`, and reports collateral to | none |
 | PledgeVault | `configure_asset` | `custody_mode` | escrow or issuer-lien custody for new pledges; a position that still holds units keeps its mode and refuses pledges in the other one | none |
 | PledgeVault | `set_gateway` | gateway address | who can confirm lien-mode pledges | none |
-| ExitDesk | `configure_asset` | `price_guard`, `spread_bps`, `per_holder_daily_cap`, `desk_inventory_cap` | the exit price and how much can be exited | none (#214) |
+| ExitDesk | `configure_asset` | `price_guard`, `spread_bps`, `per_holder_daily_cap`, `desk_inventory_cap` | the exit price and how much can be exited | tightening immediate; a new `price_guard`, a lower spread or a higher cap 48h via `queue_configure_asset`; an asset's first listing is immediate |
 | ExitDesk | `set_usdc` | USDC address | the token exits pay out in | none |
 | RepoDvp | `configure_asset` | `price_guard`, `haircut_bps`, `thresholds` | margin evaluation, so when `call_margin` and `default_close` can run, and the price `default_close` uses for the lender's units | none (#215) |
 | RepoDvp | `configure_asset` | `max_cash_per_trade`, `max_term_seconds` | which new proposals are accepted | none (#215) |
@@ -65,7 +65,7 @@ no timelock, and applies to positions that are already open.
 | PriceGuard | `configure_signature_requirement` | NAV signature on/off | whether unsigned NAV is accepted | turning it on immediate; turning it off 48h via `queue_config` |
 | Registry | `queue_param` | haircuts and other asset params | Registry's own asset parameters (the contracts above read their own config, not Registry's) | 48h |
 
-The timelock column should be updated as #214 and #215 land, along with any RepoDvp `set_usdc`
+The timelock column should be updated as #215 lands, along with any RepoDvp `set_usdc`
 change. #103 covers the full Registry and PriceGuard timelocked-or-immediate breakdown.
 
 The admin is trusted to choose margin thresholds, but not to choose ones that break the state
@@ -185,6 +185,12 @@ change are not re-checked; calling `configure_asset` again is the only way to re
 
 ## ExitDesk
 
+- `configure_asset` applies at once only for the first listing of an asset, or for changes that
+  cannot raise payouts (same `price_guard`, spread not lower, caps not higher). A new `price_guard`,
+  a lower spread or a higher cap must be queued with `queue_configure_asset` and executed after the
+  48h timelock (`ballast_common::timelock`). The admin can cancel it in the meantime. The first
+  listing is still immediate, so a compromised admin could list a new asset with a hostile
+  `price_guard` against the shared float; that path is not timelocked.
 - The desk's USDC float and the RWA inventory it accumulates from exits have an admin-only `withdraw`.
   Without it the inventory only ever grew toward `desk_inventory_cap` and the desk eventually refused
   every exit, with no way to rebalance. Withdrawing an RWA frees the same amount under its cap. This is
