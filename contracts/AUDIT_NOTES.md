@@ -54,7 +54,7 @@ no timelock, and applies to positions that are already open.
 | PledgeVault | `configure_asset` | `credit_line` | the contract the vault asks for debt, borrower and LTV before `release`, and reports collateral to | none |
 | PledgeVault | `configure_asset` | `custody_mode` | escrow or issuer-lien custody for new pledges; a position that still holds units keeps its mode and refuses pledges in the other one | none |
 | PledgeVault | `set_gateway` | gateway address | who can confirm lien-mode pledges | none |
-| ExitDesk | `configure_asset` | `price_guard`, `spread_bps`, `per_holder_daily_cap`, `desk_inventory_cap` | the exit price and how much can be exited | tightening immediate; a new `price_guard`, a lower spread or a higher cap 48h via `queue_configure_asset`; an asset's first listing is immediate |
+| ExitDesk | `configure_asset` | `price_guard`, `spread_bps`, `per_holder_daily_cap`, `desk_daily_cap`, `desk_inventory_cap` | the exit price and how much can be exited | tightening immediate; a new `price_guard`, a lower spread or a higher cap 48h via `queue_configure_asset`; an asset's first listing is immediate |
 | ExitDesk | `set_usdc` | USDC address | the token exits pay out in | none |
 | RepoDvp | `configure_asset` | `price_guard`, `haircut_bps`, `thresholds` | margin evaluation, so when `call_margin` and `default_close` can run, and the price `default_close` uses for the lender's units | none (#215) |
 | RepoDvp | `configure_asset` | `max_cash_per_trade`, `max_term_seconds` | which new proposals are accepted | none (#215) |

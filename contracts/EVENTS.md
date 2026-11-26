@@ -175,7 +175,7 @@ Field notes:
 - `configure_asset` itself publishes nothing (issue #835). The timelocked path from #214
   (`queue_configure_asset` / `execute_configure_asset` / `cancel_configure_asset`) publishes
   `cfg_q`, `cfg_exec` and `cfg_canc`; `AssetConfig` is ExitDesk's own struct
-  `{ price_guard, spread_bps, per_holder_daily_cap, desk_inventory_cap }`.
+  `{ price_guard, spread_bps, per_holder_daily_cap, desk_daily_cap, desk_inventory_cap }`.
 
 ### Same topic name, different shape
 
@@ -219,7 +219,7 @@ contract.
 | RepoDvp | `usdc`, `curegrace`, `cfgasset` | not specified | new values (old values where cheap) | `set_usdc`, `set_cure_grace`, `configure_asset` | #207 |
 | RepoDvp | `mcall` (**breaking**: bare value becomes a tuple) | `id: u64` | `(margin_call_amount: i128, exposure: i128, ltv_bps: u32, price: i128, cure_deadline: u64)` | `call_margin` | #840 |
 | RepoDvp | `cured` (**breaking**: `0i128` becomes a tuple) | `id: u64` | `(exposure: i128, ltv_bps: u32, price: i128)` | `call_margin` | #840 |
-| ExitDesk | `cfgasset` | `asset: Address` | `(price_guard: Address, spread_bps: u32, per_holder_daily_cap: i128, desk_inventory_cap: i128)` | `configure_asset` | #835 |
+| ExitDesk | `cfgasset` | `asset: Address` | `(price_guard: Address, spread_bps: u32, per_holder_daily_cap: i128, desk_daily_cap: i128, desk_inventory_cap: i128)` | `configure_asset` | #835 |
 | ExitDesk | `exit` (**breaking**: bare value becomes a tuple) | `holder: Address, asset: Address` | `(units: i128, usdc_out: i128, price: i128, to: Address)` | `exit`, `exit_before` | #831 |
 
 The **breaking** rows change an existing payload, so they need the coordinated consumer change
