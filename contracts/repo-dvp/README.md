@@ -19,8 +19,7 @@ The `RepoDvP` contract provides bilateral repos of Real World Asset (RWA) tokens
 The trade-lifecycle entry points publish events with the shape `((Symbol, id), payload)`, listed
 below. The asset toggles (`disable`, `enable`, keyed by the asset) and the pause events
 (`paused`, `unpause_queued`, `unpause_cancelled`, `unpause_executed`) are listed with their exact
-shapes in [`../EVENTS.md`](../EVENTS.md). `configure_asset` and the admin setters publish nothing
-today (#207).
+shapes in [`../EVENTS.md`](../EVENTS.md). Admin events are in the second table below.
 
 | Event | Topics | Data | Emitted by | Description |
 |---|---|---|---|---|
@@ -33,3 +32,15 @@ today (#207).
 | `topup` | `(Symbol("topup"), id: u64)` | `(units: i128, cured: bool)` | `top_up` | Published when the borrower adds collateral to top up a trade. |
 | `default` | `(Symbol("default"), id: u64)` | `(lender_units: i128, borrower_units: i128)` | `default_close` | Published when an uncured margin call is defaulted by the keeper. |
 | `mat_def` | `(Symbol("mat_def"), id: u64)` | `(lender_units: i128, borrower_units: i128)` | `default_at_maturity` | Published when an unpaid trade past maturity grace is defaulted. |
+
+### Admin events
+
+Admin changes publish the new value (and the old one where it is cheap to read), so an auditor or
+the ledger service can see when a risk parameter changed without diffing storage:
+
+| Event | Topics | Data | Emitted by | Description |
+|---|---|---|---|---|
+| `usdc` | `(Symbol("usdc"),)` | `(old_usdc: Option<Address>, new_usdc: Address)` | `set_usdc` | Cash-leg token set or changed. `old_usdc` is `None` on the first call. |
+| `curegrace` | `(Symbol("curegrace"),)` | `(old_seconds: u64, new_seconds: u64)` | `set_cure_grace` | Margin-call cure window changed (applies to calls opened from then on). |
+| `matgrace` | `(Symbol("matgrace"),)` | `(old_seconds: u64, new_seconds: u64)` | `set_maturity_grace` | Grace after maturity before `default_at_maturity` can act. |
+| `cfgasset` | `(Symbol("cfgasset"), asset: Address)` | `(price_guard: Address, haircut_bps: u32, thresholds: MarginThresholds, max_cash_per_trade: i128, max_term_seconds: u64)` | `configure_asset` | Asset risk parameters set; the payload is the full new config. |

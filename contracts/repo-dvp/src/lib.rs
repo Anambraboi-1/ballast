@@ -93,8 +93,9 @@
 //! ## Contract Events
 //!
 //! The trade-lifecycle entry points publish events with the shape `((Symbol, id), payload)`, listed
-//! below. `disable`/`enable` (keyed by the asset) and the pause events are in `contracts/EVENTS.md`;
-//! `configure_asset` and the admin setters publish nothing today (#207).
+//! below. `disable`/`enable` (keyed by the asset) and the pause events are in `contracts/EVENTS.md`.
+//! The admin setters publish `usdc`, `curegrace` and `matgrace` with `(old, new)`, and
+//! `configure_asset` publishes `cfgasset` keyed by the asset with the full new config (see README).
 //!
 //! | Event | Topics | Data | Emitted by | Description |
 //! |---|---|---|---|---|
@@ -587,7 +588,10 @@ impl RepoDvp {
     pub fn set_usdc(env: Env, admin: Address, usdc: Address) {
         require_admin_is(&env, &admin);
         ttl::extend_instance(&env);
+        let old_usdc: Option<Address> = env.storage().instance().get(&DataKey::Usdc);
         env.storage().instance().set(&DataKey::Usdc, &usdc);
+        env.events()
+            .publish((symbol_short!("usdc"),), (old_usdc, usdc));
     }
 
     /// Sets how long a borrower has to cure a margin call opened from now on (default 24h, at
@@ -599,7 +603,10 @@ impl RepoDvp {
             seconds >= MIN_CURE_GRACE_SECONDS,
             "repo-dvp: cure window is shorter than the minimum"
         );
+        let old_grace = cure_grace(&env);
         env.storage().instance().set(&DataKey::CureGrace, &seconds);
+        env.events()
+            .publish((symbol_short!("curegrace"),), (old_grace, seconds));
     }
 
     pub fn cure_grace_seconds(env: Env) -> u64 {
@@ -616,9 +623,12 @@ impl RepoDvp {
             seconds >= MIN_MATURITY_GRACE_SECONDS,
             "repo-dvp: maturity grace is shorter than the minimum"
         );
+        let old_grace = maturity_grace(&env);
         env.storage()
             .instance()
             .set(&DataKey::MaturityGrace, &seconds);
+        env.events()
+            .publish((symbol_short!("matgrace"),), (old_grace, seconds));
     }
 
     pub fn maturity_grace_seconds(env: Env) -> u64 {
@@ -726,12 +736,22 @@ impl RepoDvp {
         env.storage().instance().set(
             &DataKey::AssetConfig(asset.clone()),
             &RepoAssetConfig {
+                price_guard: price_guard.clone(),
+                haircut_bps,
+                thresholds: thresholds.clone(),
+                max_cash_per_trade,
+                max_term_seconds,
+            },
+        );
+        env.events().publish(
+            (symbol_short!("cfgasset"), asset),
+            (
                 price_guard,
                 haircut_bps,
                 thresholds,
                 max_cash_per_trade,
                 max_term_seconds,
-            },
+            ),
         );
     }
 
