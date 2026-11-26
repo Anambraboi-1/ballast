@@ -153,13 +153,32 @@ fn set_price(h: &Harness, value: i128, status: PriceStatus) {
     );
 }
 
+/// Configures the asset with the desk daily cap set to the inventory cap, so it never binds
+/// before the inventory cap does. Tests of the desk daily cap use `configure_with_desk_daily_cap`.
 fn configure(h: &Harness, spread_bps: u32, per_holder_daily_cap: i128, desk_inventory_cap: i128) {
+    configure_with_desk_daily_cap(
+        h,
+        spread_bps,
+        per_holder_daily_cap,
+        desk_inventory_cap,
+        desk_inventory_cap,
+    );
+}
+
+fn configure_with_desk_daily_cap(
+    h: &Harness,
+    spread_bps: u32,
+    per_holder_daily_cap: i128,
+    desk_daily_cap: i128,
+    desk_inventory_cap: i128,
+) {
     ExitDeskClient::new(&h.env, &h.desk).configure_asset(
         &h.admin,
         &h.rwa,
         &h.price_guard,
         &spread_bps,
         &per_holder_daily_cap,
+        &desk_daily_cap,
         &desk_inventory_cap,
     );
 }
@@ -172,7 +191,7 @@ fn fund_desk(h: &Harness, amount: i128) {
 #[test]
 fn quote_with_ok_price_applies_spread() {
     let h = setup();
-    configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    configure_with_desk_daily_cap(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
     set_price(&h, PRICE_SCALE, PriceStatus::Ok); // $1.00
 
     let quote = ExitDeskClient::new(&h.env, &h.desk).quote(&h.rwa, &(100 * PRICE_SCALE));
@@ -194,7 +213,7 @@ fn quote_with_ok_price_applies_spread() {
 #[test]
 fn exit_happy_path_settles_both_legs() {
     let h = setup();
-    configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    configure_with_desk_daily_cap(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
     set_price(&h, PRICE_SCALE, PriceStatus::Ok);
     fund_desk(&h, 10_000 * PRICE_SCALE);
 
@@ -290,7 +309,7 @@ fn exit_before_after_deadline_panics() {
 #[should_panic(expected = "exit-desk: price is not Ok")]
 fn exit_panics_on_degraded_price() {
     let h = setup();
-    configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    configure_with_desk_daily_cap(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
     set_price(&h, PRICE_SCALE, PriceStatus::Degraded);
     fund_desk(&h, 10_000 * PRICE_SCALE);
 
@@ -305,7 +324,7 @@ fn exit_panics_on_degraded_price() {
 #[should_panic(expected = "exit-desk: price is not Ok")]
 fn exit_panics_on_halted_price() {
     let h = setup();
-    configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    configure_with_desk_daily_cap(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
     set_price(&h, PRICE_SCALE, PriceStatus::Halted);
     fund_desk(&h, 10_000 * PRICE_SCALE);
 
@@ -321,7 +340,7 @@ fn exit_panics_on_halted_price() {
 fn exit_panics_on_per_holder_daily_cap() {
     let h = setup();
     let cap = 150 * PRICE_SCALE;
-    configure(&h, 100, cap, 1_000_000 * PRICE_SCALE);
+    configure_with_desk_daily_cap(&h, 100, cap, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
     set_price(&h, PRICE_SCALE, PriceStatus::Ok);
     fund_desk(&h, 10_000 * PRICE_SCALE);
 
@@ -335,11 +354,75 @@ fn exit_panics_on_per_holder_daily_cap() {
 }
 
 #[test]
+#[should_panic(expected = "exit-desk: exceeds desk daily cap")]
+fn exit_panics_on_desk_daily_cap_across_two_holders() {
+    let h = setup();
+    let per_holder_cap = 100 * PRICE_SCALE;
+    let desk_daily_cap = 150 * PRICE_SCALE;
+    let desk_inventory_cap = 1_000_000 * PRICE_SCALE;
+    configure_with_desk_daily_cap(&h, 100, per_holder_cap, desk_daily_cap, desk_inventory_cap);
+    set_price(&h, PRICE_SCALE, PriceStatus::Ok);
+    fund_desk(&h, 10_000 * PRICE_SCALE);
+
+    let holder1 = Address::generate(&h.env);
+    let holder2 = Address::generate(&h.env);
+    let units1 = 90 * PRICE_SCALE;
+    let units2 = 70 * PRICE_SCALE;
+    MockTokenClient::new(&h.env, &h.rwa).mint(&holder1, &units1);
+    MockTokenClient::new(&h.env, &h.rwa).mint(&holder2, &units2);
+
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+    // holder1 exits 90 units (under per-holder cap of 100, total desk daily = 90 <= 150)
+    desk.exit(&holder1, &h.rwa, &units1, &0, &holder1);
+
+    // holder2 exits 70 units (under per-holder cap of 100, but 90 + 70 = 160 > 150 desk daily cap)
+    desk.exit(&holder2, &h.rwa, &units2, &0, &holder2);
+}
+
+#[test]
+fn exit_desk_daily_cap_exact_boundary_and_rollover() {
+    let h = setup();
+    let per_holder_cap = 100 * PRICE_SCALE;
+    let desk_daily_cap = 150 * PRICE_SCALE;
+    let desk_inventory_cap = 1_000_000 * PRICE_SCALE;
+    configure_with_desk_daily_cap(&h, 100, per_holder_cap, desk_daily_cap, desk_inventory_cap);
+    set_price(&h, PRICE_SCALE, PriceStatus::Ok);
+    fund_desk(&h, 10_000 * PRICE_SCALE);
+
+    let holder1 = Address::generate(&h.env);
+    let holder2 = Address::generate(&h.env);
+    MockTokenClient::new(&h.env, &h.rwa).mint(&holder1, &(200 * PRICE_SCALE));
+    MockTokenClient::new(&h.env, &h.rwa).mint(&holder2, &(200 * PRICE_SCALE));
+
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+
+    // Initial timestamp: 100_000 (day bucket 1)
+    h.env.ledger().set_timestamp(100_000);
+
+    // holder1 exits 80 units: desk daily = 80
+    desk.exit(&holder1, &h.rwa, &(80 * PRICE_SCALE), &0, &holder1);
+
+    // holder2 exits exactly 70 units: desk daily hits exact boundary 80 + 70 = 150 <= 150
+    desk.exit(&holder2, &h.rwa, &(70 * PRICE_SCALE), &0, &holder2);
+
+    // One more unit on same day fails
+    let refused = desk.try_exit(&holder1, &h.rwa, &PRICE_SCALE, &0, &holder1);
+    assert!(refused.is_err(), "exceeding desk daily cap by 1 stroop must fail");
+
+    // Rollover to next UTC day (add 86_400 seconds)
+    h.env.ledger().set_timestamp(100_000 + 86_400);
+
+    // On next day, daily cap is reset and exit succeeds
+    desk.exit(&holder1, &h.rwa, &(80 * PRICE_SCALE), &0, &holder1);
+    desk.exit(&holder2, &h.rwa, &(70 * PRICE_SCALE), &0, &holder2);
+}
+
+#[test]
 #[should_panic(expected = "exit-desk: exceeds desk inventory cap")]
 fn exit_panics_on_desk_inventory_cap() {
     let h = setup();
     let cap = 50 * PRICE_SCALE;
-    configure(&h, 100, 1_000_000 * PRICE_SCALE, cap);
+    configure_with_desk_daily_cap(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE, cap);
     set_price(&h, PRICE_SCALE, PriceStatus::Ok);
     fund_desk(&h, 10_000 * PRICE_SCALE);
 
@@ -354,7 +437,7 @@ fn exit_panics_on_desk_inventory_cap() {
 #[should_panic(expected = "slippage")]
 fn exit_panics_on_slippage() {
     let h = setup();
-    configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    configure_with_desk_daily_cap(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
     set_price(&h, PRICE_SCALE, PriceStatus::Ok);
     fund_desk(&h, 10_000 * PRICE_SCALE);
 
@@ -376,7 +459,7 @@ const PAYOUT_FOR_100_UNITS: i128 = 99 * PRICE_SCALE;
 fn desk_with_float(float: i128) -> (Harness, Address, i128) {
     let h = setup();
     let units = 100 * PRICE_SCALE;
-    configure(&h, 100, units, units);
+    configure_with_desk_daily_cap(&h, 100, units, units, units);
     set_price(&h, PRICE_SCALE, PriceStatus::Ok);
     if float > 0 {
         fund_desk(&h, float);
@@ -495,6 +578,7 @@ fn desk_without_a_usdc_token() -> (Env, ExitDeskClient<'static>, Address) {
         &100,
         &(1_000 * PRICE_SCALE),
         &(1_000 * PRICE_SCALE),
+        &(1_000 * PRICE_SCALE),
     );
     MockPriceGuardClient::new(&env, &price_guard).set_price(
         &rwa,
@@ -525,7 +609,7 @@ fn exit_before_a_usdc_token_is_set_still_says_usdc_is_not_configured() {
 #[should_panic(expected = "exit-desk: usdc_out is zero")]
 fn exit_rejects_a_dust_amount_that_would_pay_zero() {
     let h = setup();
-    configure(&h, 25, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    configure_with_desk_daily_cap(&h, 25, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
     set_price(&h, PRICE_SCALE, PriceStatus::Ok);
     fund_desk(&h, 10_000 * PRICE_SCALE);
 
@@ -539,7 +623,7 @@ fn exit_rejects_a_dust_amount_that_would_pay_zero() {
 #[test]
 fn quote_for_a_dust_amount_still_returns_zero_as_a_read() {
     let h = setup();
-    configure(&h, 25, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    configure_with_desk_daily_cap(&h, 25, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
     set_price(&h, PRICE_SCALE, PriceStatus::Ok);
 
     let quote = ExitDeskClient::new(&h.env, &h.desk).quote(&h.rwa, &1);
@@ -551,19 +635,33 @@ fn quote_for_a_dust_amount_still_returns_zero_as_a_read() {
 #[should_panic(expected = "exit-desk: spread must be below 100%")]
 fn configure_asset_rejects_a_full_spread() {
     let h = setup();
-    configure(&h, 10_000, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    configure_with_desk_daily_cap(&h, 10_000, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
 }
 
 #[test]
 fn configure_asset_accepts_the_largest_spread_below_100_percent() {
     let h = setup();
-    configure(&h, 9_999, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    configure_with_desk_daily_cap(&h, 9_999, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+}
+
+#[test]
+#[should_panic(expected = "exit-desk: desk_daily_cap must be positive")]
+fn configure_asset_rejects_zero_desk_daily_cap() {
+    let h = setup();
+    configure_with_desk_daily_cap(&h, 100, 1_000 * PRICE_SCALE, 0, 1_000 * PRICE_SCALE);
+}
+
+#[test]
+#[should_panic(expected = "exit-desk: desk_daily_cap must be positive")]
+fn configure_asset_rejects_negative_desk_daily_cap() {
+    let h = setup();
+    configure_with_desk_daily_cap(&h, 100, 1_000 * PRICE_SCALE, -1, 1_000 * PRICE_SCALE);
 }
 
 #[test]
 fn the_admin_can_take_the_usdc_float_back_out() {
     let h = setup();
-    configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    configure_with_desk_daily_cap(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
     fund_desk(&h, 1_000 * PRICE_SCALE);
 
     let treasury = Address::generate(&h.env);
@@ -577,7 +675,7 @@ fn the_admin_can_take_the_usdc_float_back_out() {
 fn withdrawing_rwa_inventory_frees_room_under_the_inventory_cap() {
     let h = setup();
     // The desk may hold at most 100 units.
-    configure(&h, 100, 1_000_000 * PRICE_SCALE, 100 * PRICE_SCALE);
+    configure_with_desk_daily_cap(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE, 100 * PRICE_SCALE);
     set_price(&h, PRICE_SCALE, PriceStatus::Ok);
     fund_desk(&h, 10_000 * PRICE_SCALE);
     let desk = ExitDeskClient::new(&h.env, &h.desk);
@@ -691,7 +789,7 @@ fn fund_panics_on_mismatched_usdc() {
 
 fn disabled_asset_blocks_quote_and_exit_but_allows_withdraw_and_reenable() {
     let h = setup();
-    configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    configure_with_desk_daily_cap(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
     set_price(&h, PRICE_SCALE, PriceStatus::Ok);
     fund_desk(&h, 10_000 * PRICE_SCALE);
     let desk = ExitDeskClient::new(&h.env, &h.desk);
@@ -744,7 +842,7 @@ fn disabled_asset_blocks_quote_and_exit_but_allows_withdraw_and_reenable() {
 #[test]
 fn pauser_can_pause_exits_and_exit_panics_while_quote_and_withdraw_work() {
     let h = setup();
-    configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    configure_with_desk_daily_cap(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
     set_price(&h, PRICE_SCALE, PriceStatus::Ok);
     fund_desk(&h, 10_000 * PRICE_SCALE);
 
@@ -774,7 +872,7 @@ fn pauser_can_pause_exits_and_exit_panics_while_quote_and_withdraw_work() {
 #[test]
 fn pauser_can_pause_all_and_exit_panics_while_quote_and_withdraw_work() {
     let h = setup();
-    configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    configure_with_desk_daily_cap(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
     set_price(&h, PRICE_SCALE, PriceStatus::Ok);
     fund_desk(&h, 10_000 * PRICE_SCALE);
 
@@ -812,7 +910,7 @@ fn pause_rejects_non_pauser() {
 #[test]
 fn unpause_enforces_timelock_and_restores_exits() {
     let h = setup();
-    configure(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
+    configure_with_desk_daily_cap(&h, 100, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE, 1_000_000 * PRICE_SCALE);
     set_price(&h, PRICE_SCALE, PriceStatus::Ok);
     fund_desk(&h, 10_000 * PRICE_SCALE);
 
@@ -900,6 +998,244 @@ fn read_only_getters_and_capacity_track_state() {
     );
 }
 
+// --- configure_asset timelock (issue #214) ---
+
+const CAP: i128 = 1_000 * PRICE_SCALE;
+
+fn reconfigure(h: &Harness, price_guard: &Address, spread_bps: u32, holder_cap: i128, desk_cap: i128) {
+    ExitDeskClient::new(&h.env, &h.desk).configure_asset(
+        &h.admin,
+        &h.rwa,
+        price_guard,
+        &spread_bps,
+        &holder_cap,
+        &desk_cap,
+        &desk_cap,
+    );
+}
+
+fn queue(h: &Harness, price_guard: &Address, spread_bps: u32, holder_cap: i128, desk_cap: i128) -> u64 {
+    ExitDeskClient::new(&h.env, &h.desk).queue_configure_asset(
+        &h.admin,
+        &h.rwa,
+        price_guard,
+        &spread_bps,
+        &holder_cap,
+        &desk_cap,
+        &desk_cap,
+    )
+}
+
+fn advance(h: &Harness, seconds: u64) {
+    h.env.ledger().set_timestamp(h.env.ledger().timestamp() + seconds);
+}
+
+#[test]
+fn configure_asset_applies_tightening_changes_immediately() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    // Wider spread and lower caps, same price guard: no delay.
+    reconfigure(&h, &h.price_guard, 250, CAP / 2, CAP / 4);
+    let cfg = ExitDeskClient::new(&h.env, &h.desk).asset_config(&h.rwa);
+    assert_eq!(cfg.spread_bps, 250);
+    assert_eq!(cfg.per_holder_daily_cap, CAP / 2);
+    assert_eq!(cfg.desk_inventory_cap, CAP / 4);
+}
+
+#[test]
+fn configure_asset_accepts_an_unchanged_config() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    // Re-running the deploy script with the same values must not fail.
+    configure(&h, 100, CAP, CAP);
+}
+
+#[test]
+#[should_panic(expected = "use queue_configure_asset")]
+fn configure_asset_refuses_a_new_price_guard() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    let attacker_guard = h.env.register(MockPriceGuard, ());
+    reconfigure(&h, &attacker_guard, 100, CAP, CAP);
+}
+
+#[test]
+#[should_panic(expected = "use queue_configure_asset")]
+fn configure_asset_refuses_a_lower_spread() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    reconfigure(&h, &h.price_guard, 99, CAP, CAP);
+}
+
+#[test]
+#[should_panic(expected = "use queue_configure_asset")]
+fn configure_asset_refuses_a_higher_holder_cap() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    reconfigure(&h, &h.price_guard, 100, CAP + 1, CAP);
+}
+
+#[test]
+#[should_panic(expected = "use queue_configure_asset")]
+fn configure_asset_refuses_a_higher_inventory_cap() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    reconfigure(&h, &h.price_guard, 100, CAP, CAP + 1);
+}
+
+#[test]
+#[should_panic(expected = "use queue_configure_asset")]
+fn configure_asset_refuses_a_mixed_change_that_loosens_anything() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    // Wider spread (tightening) but a higher cap (loosening): the whole change is timelocked.
+    reconfigure(&h, &h.price_guard, 500, CAP * 2, CAP);
+}
+
+#[test]
+fn queued_price_guard_change_applies_only_after_48h() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    set_price(&h, PRICE_SCALE, PriceStatus::Ok);
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+
+    // The new guard reports 10x the price.
+    let new_guard = h.env.register(MockPriceGuard, ());
+    MockPriceGuardClient::new(&h.env, &new_guard).set_price(
+        &h.rwa,
+        &(10 * PRICE_SCALE),
+        &PriceStatus::Ok,
+        &h.env.ledger().timestamp(),
+    );
+
+    let id = queue(&h, &new_guard, 100, CAP, CAP);
+    let pending = desk.pending_config(&id).expect("queued");
+    assert_eq!(pending.asset, h.rwa);
+    assert_eq!(pending.config.price_guard, new_guard);
+    assert_eq!(
+        pending.executes_at,
+        h.env.ledger().timestamp() + timelock::TIMELOCK_DELAY_SECONDS
+    );
+
+    // Nothing changes while queued: quotes still use the old guard.
+    assert_eq!(desk.asset_config(&h.rwa).price_guard, h.price_guard);
+    assert_eq!(desk.quote(&h.rwa, &PRICE_SCALE).price, 9_900_000);
+
+    // One second short of 48h: still refused.
+    advance(&h, timelock::TIMELOCK_DELAY_SECONDS - 1);
+    let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        desk.execute_configure_asset(&id);
+    }));
+    assert!(early.is_err(), "execute before the timelock elapses must fail");
+    assert_eq!(desk.asset_config(&h.rwa).price_guard, h.price_guard);
+
+    advance(&h, 1);
+    desk.execute_configure_asset(&id);
+    assert_eq!(desk.asset_config(&h.rwa).price_guard, new_guard);
+    assert_eq!(desk.quote(&h.rwa, &PRICE_SCALE).price, 99_000_000);
+    assert!(desk.pending_config(&id).is_none());
+}
+
+#[test]
+fn queued_spread_decrease_and_cap_increase_apply_after_48h() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+
+    let id = queue(&h, &h.price_guard, 10, CAP * 2, CAP * 3);
+    assert_eq!(desk.asset_config(&h.rwa).spread_bps, 100);
+
+    advance(&h, timelock::TIMELOCK_DELAY_SECONDS);
+    desk.execute_configure_asset(&id);
+
+    let cfg = desk.asset_config(&h.rwa);
+    assert_eq!(cfg.spread_bps, 10);
+    assert_eq!(cfg.per_holder_daily_cap, CAP * 2);
+    assert_eq!(cfg.desk_inventory_cap, CAP * 3);
+}
+
+#[test]
+#[should_panic(expected = "exit-desk: no such pending config")]
+fn a_queued_config_executes_only_once() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+    let id = queue(&h, &h.price_guard, 50, CAP, CAP);
+    advance(&h, timelock::TIMELOCK_DELAY_SECONDS);
+    desk.execute_configure_asset(&id);
+    desk.execute_configure_asset(&id);
+}
+
+#[test]
+fn cancelled_config_never_applies() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+    let attacker_guard = h.env.register(MockPriceGuard, ());
+
+    let id = queue(&h, &attacker_guard, 100, CAP, CAP);
+    desk.cancel_configure_asset(&h.admin, &id);
+    assert!(desk.pending_config(&id).is_none());
+
+    advance(&h, timelock::TIMELOCK_DELAY_SECONDS);
+    let exec = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        desk.execute_configure_asset(&id);
+    }));
+    assert!(exec.is_err(), "executing a cancelled config must fail");
+    assert_eq!(desk.asset_config(&h.rwa).price_guard, h.price_guard);
+}
+
+#[test]
+#[should_panic(expected = "exit-desk: spread must be below 100%")]
+fn queue_configure_asset_validates_at_queue_time() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    queue(&h, &h.price_guard, 10_000, CAP, CAP);
+}
+
+#[test]
+#[should_panic]
+fn queue_configure_asset_rejects_non_admin() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    let stranger = Address::generate(&h.env);
+    ExitDeskClient::new(&h.env, &h.desk).queue_configure_asset(
+        &stranger,
+        &h.rwa,
+        &h.price_guard,
+        &50,
+        &CAP,
+        &CAP,
+        &CAP,
+    );
+}
+
+#[test]
+#[should_panic]
+fn cancel_configure_asset_rejects_non_admin() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    let id = queue(&h, &h.price_guard, 50, CAP, CAP);
+    let stranger = Address::generate(&h.env);
+    ExitDeskClient::new(&h.env, &h.desk).cancel_configure_asset(&stranger, &id);
+}
+
+#[test]
+fn a_queued_config_replaces_a_later_tightening_on_execute() {
+    let h = setup();
+    configure(&h, 100, CAP, CAP);
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+
+    let id = queue(&h, &h.price_guard, 50, CAP, CAP);
+    // The operator tightens meanwhile; the queued config is a full replacement and wins on execute.
+    reconfigure(&h, &h.price_guard, 300, CAP / 2, CAP / 2);
+    advance(&h, timelock::TIMELOCK_DELAY_SECONDS);
+    desk.execute_configure_asset(&id);
+
+    let cfg = desk.asset_config(&h.rwa);
+    assert_eq!(cfg.spread_bps, 50);
+    assert_eq!(cfg.per_holder_daily_cap, CAP);
+}
 
 // --- Storage lifetime (#208) ---
 
@@ -1019,4 +1355,62 @@ fn the_daily_cap_resets_at_the_next_utc_day() {
     desk.exit(&holder, &h.rwa, &units, &0, &holder);
     assert_eq!(desk.daily_used(&holder, &h.rwa), units);
     assert_eq!(desk.inventory(&h.rwa), units * 2);
+}
+
+// --- Desk daily cap integration (#195 with #208 and #214) ---
+
+#[test]
+#[should_panic(expected = "use queue_configure_asset")]
+fn configure_asset_refuses_a_higher_desk_daily_cap() {
+    let h = setup();
+    configure_with_desk_daily_cap(&h, 100, CAP, CAP, CAP * 2);
+    configure_with_desk_daily_cap(&h, 100, CAP, CAP + 1, CAP * 2);
+}
+
+#[test]
+fn configure_asset_lowers_the_desk_daily_cap_immediately() {
+    let h = setup();
+    configure_with_desk_daily_cap(&h, 100, CAP, CAP, CAP * 2);
+    configure_with_desk_daily_cap(&h, 100, CAP, CAP / 2, CAP * 2);
+    assert_eq!(
+        ExitDeskClient::new(&h.env, &h.desk)
+            .asset_config(&h.rwa)
+            .desk_daily_cap,
+        CAP / 2
+    );
+}
+
+#[test]
+fn capacity_reports_the_desk_daily_cap_when_it_binds() {
+    let h = setup();
+    let per_holder_cap = 100 * PRICE_SCALE;
+    let desk_daily_cap = 150 * PRICE_SCALE;
+    configure_with_desk_daily_cap(&h, 100, per_holder_cap, desk_daily_cap, 1_000_000 * PRICE_SCALE);
+    set_price(&h, PRICE_SCALE, PriceStatus::Ok);
+    fund_desk(&h, 10_000 * PRICE_SCALE);
+    let holder1 = Address::generate(&h.env);
+    let holder2 = Address::generate(&h.env);
+    MockTokenClient::new(&h.env, &h.rwa).mint(&holder1, &(100 * PRICE_SCALE));
+    let desk = ExitDeskClient::new(&h.env, &h.desk);
+    desk.exit(&holder1, &h.rwa, &(90 * PRICE_SCALE), &0, &holder1);
+
+    // holder2 has their full 100 of holder room, but the desk has only 60 left today.
+    assert_eq!(desk.desk_daily_used(&h.rwa), 90 * PRICE_SCALE);
+    assert_eq!(
+        desk.capacity(&holder2, &h.rwa),
+        (per_holder_cap, 60 * PRICE_SCALE)
+    );
+}
+
+#[test]
+fn desk_daily_used_lives_in_temporary_storage() {
+    let (h, holder, units) = exited_desk();
+    let day = h.env.ledger().timestamp() / SECONDS_PER_DAY;
+    let key = DataKey::DeskDailyUsed(h.rwa.clone(), day);
+    h.env.as_contract(&h.desk, || {
+        assert!(!h.env.storage().persistent().has(&key));
+        assert_eq!(h.env.storage().temporary().get::<_, i128>(&key), Some(units));
+        assert_eq!(h.env.storage().temporary().get_ttl(&key), DAILY_USED_TTL_LEDGERS);
+    });
+    let _ = holder;
 }
