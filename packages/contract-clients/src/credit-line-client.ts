@@ -135,6 +135,14 @@ export class CreditLineClient extends BaseContractClient {
     return this.read<LtvView>("ltv", [scU64(line)]);
   }
 
+  /**
+   * Read-only: the `ltv` view as if the line had `newUnits` of collateral pledged, computed with
+   * the line's own haircut, thresholds and price. `PledgeVault::release` uses it on-chain (#180).
+   */
+  ltvAfter(line: bigint, newUnits: bigint): Promise<LtvView> {
+    return this.read<LtvView>("ltv_after", [scU64(line), scI128(newUnits)]);
+  }
+
   /** Read-only: exact payoff components and timestamp without calling PriceGuard (PRD §9, Backlog B-0131). */
   owed(line: bigint): Promise<Owed> {
     return this.read<Owed>("owed", [scU64(line)]);

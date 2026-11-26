@@ -50,8 +50,7 @@ no timelock, and applies to positions that are already open.
 | CreditLine | `configure_asset` | `usdc` | the token every draw, repayment, lender withdrawal, surplus payment and fee claim uses on lines for that asset, existing ones included | none |
 | CreditLine | `set_vault` | vault address | the only contract trusted to report collateral through `sync_from_vault` | none |
 | CreditLine | `set_treasury` | treasury address | who can claim repaid platform fees (`claim_fee`) | none |
-| PledgeVault | `configure_asset` | `price_guard`, `haircut_bps`, `thresholds` | the price and LTV check `release` applies while a line owes something | none |
-| PledgeVault | `configure_asset` | `credit_line` | the contract the vault asks for debt, borrower and LTV before `release`, and reports collateral to | none |
+| PledgeVault | `configure_asset` | `credit_line` | the contract the vault asks for debt, borrower and post-release LTV (`ltv_after`, computed with that CreditLine's haircut, thresholds and price) before `release`, and reports collateral to | none |
 | PledgeVault | `configure_asset` | `custody_mode` | escrow or issuer-lien custody for new pledges; a position that still holds units keeps its mode and refuses pledges in the other one | none |
 | PledgeVault | `set_gateway` | gateway address | who can confirm lien-mode pledges | none |
 | ExitDesk | `configure_asset` | `price_guard`, `spread_bps`, `per_holder_daily_cap`, `desk_daily_cap`, `desk_inventory_cap` | the exit price and how much can be exited | tightening immediate; a new `price_guard`, a lower spread or a higher cap 48h via `queue_configure_asset`; an asset's first listing is immediate |
@@ -71,7 +70,7 @@ The timelock column should be updated as #215 lands, along with any RepoDvp `set
 change. #103 covers the full Registry and PriceGuard timelocked-or-immediate breakdown.
 
 The admin is trusted to choose margin thresholds, but not to choose ones that break the state
-machine: `configure_asset` in `CreditLine`, `PledgeVault` and `RepoDvP` calls
+machine: `configure_asset` in `CreditLine` and `RepoDvP` calls
 `MarginThresholds::validate`, which refuses anything but
 `0 < warning_bps < margin_call_bps < liquidation_bps <= 10_000`. Equal thresholds were accepted
 before #78 and silently removed a state (`Warning` or `MarginCall`). Thresholds stored before that
@@ -169,8 +168,8 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
   `pledge-vault` only read their flag (`contracts/credit-line/src/lib.rs:497`,
   `contracts/pledge-vault/src/lib.rs:291`) and have no on-chain writer, so those two scopes cannot
   currently be paused on chain. Cross-contract pause reach is tracked in #210, and `repo-dvp::propose`
-  is additionally not pause-gated (#846). Because configs are local copies, `credit-line` and
-  `pledge-vault` can hold separate haircut/threshold values (#180).
+  is additionally not pause-gated (#846). `pledge-vault` holds no haircut, thresholds or price guard
+  of its own: its `release` check uses `CreditLine::ltv_after`, so the two cannot disagree (#180).
 - **Roles and pending changes are readable.** `roles()` (`contracts/registry/src/lib.rs:87`),
   `pending_admin()` (`contracts/registry/src/lib.rs:105`), `pending_role_change(id)`
   (`contracts/registry/src/lib.rs:124`) and `pending_upgrade(id)`
@@ -325,15 +324,12 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
 - `pledge` requires the line's own borrower and collateral asset, and refuses to take units in a
   different custody mode than the position already holds (`release` moves tokens or not according to
   the mode recorded on the position, so flipping it under live units would strand them).
-- `release` cross-calls `CreditLine::debt_of` and `borrower_of`; it only cross-calls `CreditLine::ltv` (and the price guard) when the line still owes something — with zero debt there is no price or LTV check, so a degraded or halted price cannot trap collateral (#182). Ownership is checked there.
+- `release` cross-calls `CreditLine::debt_of` and `borrower_of`; it only cross-calls `CreditLine::ltv_after` when the line still owes something — with zero debt there is no price or LTV check, so a degraded or halted price cannot trap collateral (#182). Ownership is checked there. `ltv_after` values the units that would remain with CreditLine's own haircut, thresholds, PriceGuard and debt (fees included), and the release needs an `Ok` price and a `Healthy` result. The vault keeps no copy of those parameters, so a release it allows is never one the next `poke` calls unhealthy (#180).
 - `liquidate` has no LTV check by design: it is the liquidation path, keeper-gated. Its safety
   depends on `CreditLine::liquidate` having confirmed the breach first, enforced off-chain by the
   keeper job, not on-chain.
-- `configure_asset` refuses a `haircut_bps` above 10,000 (`risk::validate_haircut_bps`) as well as
-  thresholds that `MarginThresholds::validate` rejects. A haircut above 100% used to be stored, and
-  every `release` against debt then panicked when it valued the remaining collateral.
-  `CreditLine::configure_asset` runs the same two checks, so the two contracts cannot disagree
-  about which configs are usable.
+- `configure_asset` takes only the line contract and custody mode. Haircut and threshold
+  validation (#177) happens once, in `CreditLine::configure_asset`, which owns those values.
 - **Pending lien cancellations and rejections:** Unconfirmed pending units in lien modes (`IssuerLien` / `CustodianLien`) can be cancelled by the borrower via `cancel_pending` (borrower-signed) or rejected by the gateway via `reject_lien` (gateway-signed, with reason). Both only decrement `pending_lien_units` and never affect counted `position.units` or move tokens.
 - **Vault `liquidate` takes its amount and recipient from the keeper.** `units` and `to` are
   supplied by the caller; on-chain they are checked only against `units > 0` and

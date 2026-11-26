@@ -93,7 +93,7 @@ Field notes:
 | `lien_recorded` | `line: u64` | `(asset: Address, units: i128, lien_ref: Bytes)` | `record_lien` (gateway) | indexer (stored only) |
 | `lien_rejected` | `line: u64` | `(asset: Address, units: i128, reason: Bytes)` | `reject_lien` (gateway) | indexer (stored only) |
 | `pending_cancelled` | `line: u64` | `(asset: Address, units: i128)` | `cancel_pending` (borrower) | indexer (stored only) |
-| `asset_configured` | `asset: Address` | `(price_guard: Address, credit_line: Address, haircut_bps: u32, thresholds: MarginThresholds, custody_mode: CustodyMode)` | `configure_asset` (admin) | indexer (stored only) |
+| `asset_configured` | `asset: Address` | `(credit_line: Address, custody_mode: CustodyMode)` | `configure_asset` (admin) | indexer (stored only) |
 | `gateway_set` | none (topic is the 1-tuple `(Symbol,)`) | `gateway: Address` (bare value, not a tuple) | `set_gateway` (admin) | indexer (stored only) |
 | `released` | `line: u64` | `(asset: Address, units: i128)` | `release` (borrower) | indexer; **ledger reconciler** (`-units`) |
 | `liquidated` | `line: u64` | `(asset: Address, units: i128, to: Address)` | `liquidate` (keeper) | indexer; **ledger reconciler** (`-units`); off-chain custodian/issuer delivery in lien modes (see the crate README) |

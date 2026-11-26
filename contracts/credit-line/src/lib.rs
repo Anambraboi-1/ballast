@@ -410,6 +410,13 @@ fn compute_ltv(env: &Env, line: &Line) -> LtvView {
 
 /// Same as `compute_ltv`, also returning the guarded price the view was computed from.
 fn read_ltv(env: &Env, line: &Line) -> (LtvView, i128) {
+    read_ltv_with_units(env, line, line.pledged_units)
+}
+
+/// `read_ltv` as if the line had `units` of collateral pledged instead of `line.pledged_units`.
+/// Same config, price and debt, so `ltv_after` and `poke` can never disagree about a given
+/// collateral figure.
+fn read_ltv_with_units(env: &Env, line: &Line, units: i128) -> (LtvView, i128) {
     let config = read_asset_config(env, &line.asset);
     let guarded = PriceGuardClient::new(env, &config.price_guard).guarded_price(&line.asset);
 
@@ -419,8 +426,7 @@ fn read_ltv(env: &Env, line: &Line) -> (LtvView, i128) {
         + interest_delta(line, now)
         + line.accrued_fee
         + fee_delta(line, now);
-    let collateral_value =
-        risk::collateral_value(line.pledged_units, guarded.value, config.haircut_bps);
+    let collateral_value = risk::collateral_value(units, guarded.value, config.haircut_bps);
     let ltv_bps = risk::ltv_bps(debt, collateral_value);
     let margin_state = margin::classify(ltv_bps, &config.thresholds);
 
@@ -811,6 +817,18 @@ impl CreditLine {
         ttl::extend_instance(&env);
         let state = read_line(&env, line);
         compute_ltv(&env, &state)
+    }
+
+    /// Read-only: the `ltv` view as if the line had `new_units` of collateral instead of what is
+    /// pledged now, computed with this contract's own haircut, thresholds, PriceGuard and debt
+    /// (interest and platform fee included). `PledgeVault::release` asks this before letting
+    /// collateral go, so the vault keeps no second copy of the risk config that could drift from
+    /// the one `poke`, `draw` and `liquidate` use (#180).
+    pub fn ltv_after(env: Env, line: u64, new_units: i128) -> LtvView {
+        ttl::extend_instance(&env);
+        assert!(new_units >= 0, "credit-line: units cannot be negative");
+        let state = read_line(&env, line);
+        read_ltv_with_units(&env, &state, new_units).0
     }
 
     /// Permissionless: recomputes the margin state via a fresh price read and persists it, also
