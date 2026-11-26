@@ -138,6 +138,9 @@ longer pause names use `Symbol::new`. Both decode to the same plain string in `c
 | `curegrace` | none | `(old_seconds: u64, new_seconds: u64)` | `set_cure_grace` (admin) | Cure window for margin calls opened from now on |
 | `matgrace` | none | `(old_seconds: u64, new_seconds: u64)` | `set_maturity_grace` (admin) | Grace past maturity before `default_at_maturity` |
 | `cfgasset` | `asset: Address` | `(price_guard: Address, haircut_bps: u32, thresholds: MarginThresholds, max_cash_per_trade: i128, max_term_seconds: u64)` | `configure_asset` (admin) | Asset risk config set; the payload is the full new config |
+| `cfg_q` | `id: u64` (timelock id) | `(asset: Address, config: RepoAssetConfig, executes_at: u64)` | `queue_asset_config` (admin) | Config change queued behind the 48h timelock |
+| `cfg_exec` | `id: u64` | `asset: Address` (bare value) | `execute_asset_config` (anyone) | Queued config applied; a `cfgasset` with the new config precedes it in the same call |
+| `cfg_canc` | `id: u64` | `asset: Address` (bare value) | `cancel_asset_config` (admin) | Queued config dropped |
 | `disable` | `asset: Address` | `()` | `disable_asset` (admin) | `propose` and `accept_and_settle` for `asset` refused; open trades can still unwind, top up and default |
 | `enable` | `asset: Address` | `()` | `enable_asset` (admin) | `asset` re-enabled |
 | `paused` | `scope: PauseScope` | `true: bool` | `pause` (pauser) | Scope paused |
@@ -154,6 +157,9 @@ Field notes:
   signal.
 - `cfgasset` shares no name with CreditLine's `asset_configured`; filter on `chain_event.contract`
   as well as `topic`.
+- `cfg_q`, `cfg_exec` and `cfg_canc` also exist on ExitDesk with a different payload shape (ExitDesk's
+  `cfg_exec` carries `(asset, config)`); filter on the contract before decoding. `tighten_asset_config`
+  (risk) publishes `cfgasset` too.
 
 ## ExitDesk (`contracts/exit-desk`)
 

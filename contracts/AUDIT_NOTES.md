@@ -11,7 +11,7 @@ code as it stands; read it alongside the module docs at the top of each `lib.rs`
 | `pauser` | pause exits on ExitDesk and new repo activity on RepoDvp, each through that contract's own `pause`; set Registry's own flags (not read by any other contract, see #210) | pause repayment, release or withdrawal paths (invariant 5); pause draws or pledges (CreditLine and PledgeVault have no `pause`, #210) |
 | `keeper` | `sync_collateral` (supplies `units`), `liquidate` (chooses when), vault `liquidate` (supplies `units`, `to`), repo `call_margin`/`default_close`/`default_at_maturity` | choose a price; liquidate without a confirmed breach on a later ledger |
 | `price_publisher` | publish NAV (signature-checked) and feed readings | set the guarded price; clear a halt |
-| `risk` | `confirm_halt_cleared` | publish prices |
+| `risk` | `confirm_halt_cleared`, `tighten_asset_config` (RepoDvp) | publish prices |
 
 The keeper is trusted for **timing and completeness**, and for three **values** it supplies (see
 "Keeper-supplied values" below). Every other amount a settlement uses comes from the contract's
@@ -55,8 +55,8 @@ no timelock, and applies to positions that are already open.
 | PledgeVault | `set_gateway` | gateway address | who can confirm lien-mode pledges | none |
 | ExitDesk | `configure_asset` | `price_guard`, `spread_bps`, `per_holder_daily_cap`, `desk_daily_cap`, `desk_inventory_cap` | the exit price and how much can be exited | tightening immediate; a new `price_guard`, a lower spread or a higher cap 48h via `queue_configure_asset`; an asset's first listing is immediate |
 | ExitDesk | `set_usdc` | USDC address | the token exits pay out in | none |
-| RepoDvp | `configure_asset` | `price_guard`, `haircut_bps`, `thresholds` | margin evaluation, so when `call_margin` and `default_close` can run, and the price `default_close` uses for the lender's units | none (#215) |
-| RepoDvp | `configure_asset` | `max_cash_per_trade`, `max_term_seconds` | which new proposals are accepted | none (#215) |
+| RepoDvp | `configure_asset` | `price_guard`, `haircut_bps`, `thresholds` | margin evaluation, so when `call_margin` and `default_close` can run, and the price `default_close` uses for the lender's units | tightening immediate (admin `configure_asset`, or risk `tighten_asset_config` for haircut/thresholds); a new `price_guard`, a lower haircut or any higher threshold or cap 48h via `queue_asset_config`; an asset's first listing is immediate |
+| RepoDvp | `configure_asset` | `max_cash_per_trade`, `max_term_seconds` | which new proposals are accepted | tightening immediate (admin `configure_asset`, or risk `tighten_asset_config` for haircut/thresholds); a new `price_guard`, a lower haircut or any higher threshold or cap 48h via `queue_asset_config`; an asset's first listing is immediate |
 | RepoDvp | `set_usdc` | USDC address | the cash token for leg 1, leg 2 and the allowances; it can be re-called, and `accept_and_settle` and `unwind` read it at call time, so a change applies to live trades | none; no tracking issue yet |
 | RepoDvp | `set_cure_grace`, `set_maturity_grace` | seconds (at least 60) | how long a borrower has to cure a margin call before `default_close`, and how long an unpaid trade waits past maturity before `default_at_maturity` can act | none |
 | PriceGuard | `configure_asset`, `queue_config` | bands, window, staleness | when a price is `Ok`, `Degraded` or `Halted` | tightening immediate; loosening 48h via `queue_config` |
@@ -66,7 +66,7 @@ no timelock, and applies to positions that are already open.
 | PriceGuard | `configure_signature_requirement` | per-asset NAV signature on/off (#95) | whether unsigned NAV is accepted for that asset | turning it on immediate; turning it off 48h via `queue_config`, except while the asset is being brought up |
 | Registry | `queue_param` | haircuts and other asset params | Registry's own asset parameters (the contracts above read their own config, not Registry's) | 48h |
 
-The timelock column should be updated as #215 lands, along with any RepoDvp `set_usdc`
+The timelock column should be updated along with any RepoDvp `set_usdc`
 change. #103 covers the full Registry and PriceGuard timelocked-or-immediate breakdown.
 
 The admin is trusted to choose margin thresholds, but not to choose ones that break the state
@@ -129,7 +129,7 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
 
 ### Related open gaps in other protocol contracts
 - `ExitDesk.configure_asset`: since #214, a new `price_guard`, a lower spread or a higher cap must go through `queue_configure_asset` (48h); tightening and an asset's first listing stay immediate.
-- `RepoDvP.configure_asset`: Currently immediate for all changes; open issue [#215](https://github.com/DevTobis/ballast/issues/215) tracks placing margin and haircut loosening behind the 48h timelock.
+- `RepoDvP.configure_asset`: since #215, a new `price_guard`, a lower haircut, a higher threshold or a higher cash/term cap must go through `queue_asset_config` (48h); tightening and an asset's first listing stay immediate, and the risk role can tighten haircut and thresholds with `tighten_asset_config`.
 ## Registry
 
 - **Holds no funds.** Registry stores role addresses, per-asset `AssetConfig`s and timelocked pending
@@ -395,6 +395,17 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
   collateral is worth less than the exposure the lender takes all of it and bears the shortfall.
   No USDC moves on default.
 - Yield on the pledged RWA during the term is not passed through.
+- **Asset configuration & timelock (#215).** An asset's first listing is applied immediately by the
+  admin. Once configured, a change that could loosen risk (a new `price_guard`, a lower haircut, any
+  higher threshold, or a higher `max_cash_per_trade` / `max_term_seconds`) is refused by
+  `configure_asset` and must be queued with `queue_asset_config`; `execute_asset_config`
+  (permissionless) applies it after 48h, and the admin can `cancel_asset_config` until then. This
+  stops an admin key from repointing `price_guard` at a contract that returns a low price (turning
+  an open call into a total seizure through `default_close`) or hiding a margin call. Tightening
+  applies immediately through `configure_asset`, and the `risk` role can raise the haircut and lower
+  the thresholds with `tighten_asset_config`. The queued config is a full replacement and
+  overwrites any tightening applied in the meantime. Residual risk: the first listing of a new asset
+  is immediate.
 - **Storage lifetime.** Every entry point extends the contract instance. Every write of a trade
   extends that trade's entry, and the instance with it, to outlast `maturity_at` plus the unwind
   grace, and never to less than about 30 days. The borrower's outstanding leg-2 sum is extended to
