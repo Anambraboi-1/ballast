@@ -14,6 +14,11 @@
  * recovers between this job's read and its transaction cannot cost the borrower their collateral.
  * Every step is safe to repeat. A trade whose guarded price is not usable is left alone: a call
  * is never opened or defaulted on a price the PriceGuard does not stand behind.
+ *
+ * Counts as: processed = `default_close` after the cure deadline, or `call_margin` opening or
+ * clearing a call. skipped = no on-chain id; trade no longer Settled (a Defaulted one is still
+ * reconciled into `repo_trade`); price not usable; healthy with no call, or a call still inside its
+ * cure window. error = the trade threw.
  */
 import { and, eq, isNull } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";

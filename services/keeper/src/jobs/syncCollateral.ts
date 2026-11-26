@@ -12,6 +12,9 @@
  *
  * A line already in step costs two reads and no transaction, which is what lets this run every
  * minute without paying a fee per line per run.
+ *
+ * Counts as: processed = `sync_collateral` submitted with the vault's units. skipped = no on-chain
+ * id, or the credit line already matches the vault. error = the line threw.
  */
 import { eq } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";

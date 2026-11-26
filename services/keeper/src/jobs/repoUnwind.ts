@@ -7,6 +7,10 @@
  * The on-chain trade id comes from `repo_trade.contract_trade_id`, which `services/api` fills in
  * when the propose transaction settles. A trade without one never reached the chain through this
  * API and is skipped (counted, not errored).
+ *
+ * Counts as: processed = `unwind` submitted, or an on-chain Unwound reconciled into the books.
+ * skipped = no on-chain id, or the trade is Defaulted (reconciled) or otherwise not Settled.
+ * error = the trade threw.
  */
 import { and, eq, lte } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";

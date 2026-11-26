@@ -27,6 +27,12 @@
  * already `Liquidating` on-chain next time and carries on from the vault.
  *
  * Operator recovery runbook: see `TROUBLESHOOTING.md` ("Liquidation runs get stuck or stop half-finished").
+ *
+ * Counts as: processed = the line was liquidated (`CreditLine.liquidate` and/or
+ * `PledgeVault.liquidate` submitted and the rows booked). skipped = no unhealthy event or no
+ * on-chain id; cured, only at MarginCall or no Ok price; breach just armed by a `poke` (a
+ * transaction was sent, but liquidation needs a later ledger); still inside the cure window; or
+ * vault and credit line disagree on units (sync-collateral repairs it). error = the line threw.
  */
 import { and, desc, eq } from "drizzle-orm";
 import { schema, type Database } from "@ballast/db";
