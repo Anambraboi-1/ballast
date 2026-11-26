@@ -8,7 +8,7 @@ code as it stands; read it alongside the module docs at the top of each `lib.rs`
 | Role | Can | Cannot |
 |---|---|---|
 | `admin` | configure assets, thresholds, price bands; set the NAV attestor key; withdraw ExitDesk's **own** USDC float and RWA inventory (see [ExitDesk](#exitdesk)); change the parameters listed in [Admin-set parameters that change settlement value](#admin-set-parameters-that-change-settlement-value), most of them immediately | transfer a borrower's pledged collateral, a lender's committed USDC or a repo party's cash or collateral (see [RepoDvP](#repodvp)) directly: CreditLine, PledgeVault and RepoDvp have no `admin_withdraw`/sweep, and every transfer of those funds needs the owning party's auth or a keeper path; sign for a borrower or lender |
-| `pauser` | pause draws/pledges/exits by scope | pause repayment, release or withdrawal paths (invariant 5) |
+| `pauser` | pause exits on ExitDesk and new repo activity on RepoDvp, each through that contract's own `pause`; set Registry's own flags (not read by any other contract, see #210) | pause repayment, release or withdrawal paths (invariant 5); pause draws or pledges (CreditLine and PledgeVault have no `pause`, #210) |
 | `keeper` | `sync_collateral` (supplies `units`), `liquidate` (chooses when), vault `liquidate` (supplies `units`, `to`), repo `call_margin`/`default_close` | choose a price; liquidate without a confirmed breach on a later ledger |
 | `price_publisher` | publish NAV (signature-checked) and feed readings | set the guarded price; clear a halt |
 | `risk` | `confirm_halt_cleared` | publish prices |
@@ -386,6 +386,14 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
 
 ## Known limits
 
+- **Emergency pause wiring across contracts.** There is no central pause: each contract reads
+  pause flags from its own instance storage, and `Registry::pause` writes only Registry's, which no
+  other contract reads. ExitDesk (`pause`, #30) and RepoDvp (`pause`, #32) can each be paused
+  directly, with a timelocked unpause, so an emergency stop means calling `pause` on each of them
+  separately. CreditLine (`Draws`) and PledgeVault (`Pledges`) have no `pause` entry point at all,
+  so those two scopes can never be set on a deployment (#210).
+  - [ ] Follow-up: update this note once CreditLine and PledgeVault get a pause writer or a central
+    pause lands.
 - Real RWAs cannot be held by these contracts unless the issuer allows it (`AUTH_REQUIRED`
   issuers must authorise the vault's trustline). Etherfuse's issuer sets `auth_revocable` and
   `clawback_enabled`, so it can freeze or claw back tokens held in the vault; price that in.
