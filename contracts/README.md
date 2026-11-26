@@ -35,7 +35,7 @@ PRD does not allow, or silently drops something it promises).
 | `cure_s` stored, never enforced | §8 (`PRD.md:555`) passes `cure_s` to `open`; invariant 3 requires an "expired cure window" before liquidation | `cure_s` is stored on the `Line` (`contracts/credit-line/src/lib.rs:143,360`) and never read; the "no quick liquidation" rule is instead enforced by requiring the breach to have been flagged by a `poke` on an earlier ledger | bug — #147 |
 | `fee_bps` has no on-chain effect | §7 (`PRD.md:496`): the `credit_line` table has `fee_bps`; §5 says the platform fee "is taken on top" | no `fee_bps` anywhere in `contracts/`; it never reaches `open`, `Line`, or `repay` | planned — #146, #920 |
 | `owed` provides payoff & accrual components | §9 (`PRD.md:606`): `GET /v1/credit-lines/{id}` returns "limit, drawn, LTV, state, next accrual" | `owed(line) -> Owed` returns principal, booked and pending interest, booked and pending platform fee, the total (always equal to `debt_of`) and `as_of`, without a PriceGuard call | intended (#131, #918) |
-| `publish_nav` gains `asset_code` | §8 (`PRD.md:545`): `publish_nav(publisher, asset, value, ts, sig)` | `publish_nav` takes an extra `asset_code: Bytes` (`contracts/price-guard/src/lib.rs:989`) for the issuer-signature check | intended — a deliberate breaking change, documented in "price-guard's `publish_nav`" below |
+| `publish_nav` signature binding | §8 (`PRD.md:545`): `publish_nav(publisher, asset, value, ts, sig)` | `configure_issuer_key` binds `asset_code: Bytes` and `publish_nav` verifies `sig` over `ballast-nav-v1:{contract}:{asset_code}:{ts}:{value}` | intended — cross-asset and cross-deployment replay prevention (#90) |
 | `unpause` is queue + execute | §8 (`PRD.md:542`): `unpause(admin, scope)` (timelocked) | no `unpause` entry point; instead `queue_unpause` (`contracts/registry/src/lib.rs:286`) + `execute_unpause` (`:323`), implementing the 48h timelock as an explicit two-step flow | intended |
 | `propose` flattens `RepoTerms` | §8 (`PRD.md:568`): `propose(cash_lender, terms: RepoTerms)` | `propose` takes the terms as separate parameters — `cash_lender, cash_borrower, asset, units, cash_amount, rate_bps, kind, maturity_at, agreement_hash` (`contracts/repo-dvp/src/lib.rs:597`); no `RepoTerms` type exists, and `cash_borrower` is named up front where the PRD only brings the borrower in at `accept_and_settle` | intended |
 | `repay` returns the applied amount | §8 (`PRD.md:558`): `repay(payer, line, amount)` (no return shown) | `repay(...) -> i128`, returning the amount applied (`min(amount, owed)`) (`contracts/credit-line/src/lib.rs:529`) | intended |
@@ -191,13 +191,24 @@ This produces `../target/wasm32v1-none/release/<crate>.wasm`. `cargo test -p <cr
 See `scripts/README.md`'s "Testnet end-to-end run" section for how to build, deploy, and wire up
 all six contracts against the public Stellar testnet.
 
-## `price-guard`'s `publish_nav` — issuer-signature verification (breaking ABI change)
+## `price-guard`'s `publish_nav` — issuer-signature verification and message binding
 
-`PriceGuard.publish_nav` now takes an additional `asset_code: Bytes` argument (the asset's ticker,
-e.g. `"SPIKO"`, as raw UTF-8 bytes — see the crate's module doc comment) and, when the asset's
-`require_nav_signature` flag is `true` (the default), verifies `sig` against the asset's registered
-issuer key (`configure_issuer_key`, admin-only) over the canonical message
-`"{asset_code}:{ts}:{value}"`, via `env.crypto().ed25519_verify(...)`.
+When the asset's `require_nav_signature` flag is `true` (the default), `PriceGuard.publish_nav`
+verifies `sig` against the asset's registered issuer key (`configure_issuer_key`, admin-only) over
+the canonical message:
+
+```text
+ballast-nav-v1:{contract}:{asset_code}:{ts}:{value}
+```
+
+via `env.crypto().ed25519_verify(...)`. `{contract}` is the verifying PriceGuard's own `C...`
+strkey, and `asset_code` (the ticker, e.g. `"SPIKO"`, as raw UTF-8 bytes) is bound on-chain by
+`configure_issuer_key(admin, asset, asset_code, issuer_pubkey)` instead of being passed to
+`publish_nav`. A signature is therefore valid on exactly one deployment and for one asset, so it
+cannot be replayed on a redeployed PriceGuard or against another asset that shares the key (#90).
+The code is bound once: `configure_issuer_key` with a different code panics with
+`price-guard: asset code is already bound for asset and cannot be changed`. `asset_code(asset)`
+reads it back.
 
 > [!IMPORTANT]
 > NAV is signed by the **price publisher's** key (`configure_issuer_key` registers it), because
@@ -208,30 +219,37 @@ issuer key (`configure_issuer_key`, admin-only) over the canonical message
 > Full specification, key encoding command, test vectors, and operational guidance are documented in
 > [docs/nav-signing.md](../docs/nav-signing.md).
 
+> [!WARNING]
+> **Breaking ABI change (#90).** `publish_nav` lost its `asset_code` argument
+> (`publish_nav(publisher, asset, value, ts, sig)`), `configure_issuer_key` gained one
+> (`configure_issuer_key(admin, asset, asset_code, issuer_pubkey)`), the `configure_issuer_key`
+> event data changed from `issuer_pubkey` to `(asset_code, issuer_pubkey)`, and every signature
+> made in the old `{asset_code}:{ts}:{value}` format stops verifying. Callers built against the old
+> ABI fail; redeploy PriceGuard and update the publisher together.
+
 ### Operational summary & key conversion
 To configure an attestor key and enforce signatures on a deployment:
 
-1. Convert the publisher's Stellar address (`G...`) to raw 32-byte hex:
+1. Convert the publisher's Stellar address (`G...`) to raw 32-byte hex, and the ticker to hex (the
+   CLI takes `Bytes` arguments as hex):
    ```bash
    PUBLISHER_KEY_HEX=$(python3 -c 'import base64,sys; print(base64.b32decode(sys.argv[1])[1:33].hex())' "$PRICE_PUBLISHER")
+   ASSET_CODE_HEX=$(printf %s "$ASSET_CODE" | od -An -tx1 | tr -d ' \n')   # "RWA1" -> 52574131
    ```
-2. Register the attestor key:
+2. Register the attestor key and bind the asset code:
    ```bash
    stellar contract invoke --id "$PRICE_GUARD_CID" --source admin --network "$NETWORK" -- configure_issuer_key \
-     --admin "$ADMIN" --asset "$RWA_SAC" --issuer_pubkey "$PUBLISHER_KEY_HEX"
+     --admin "$ADMIN" --asset "$RWA_SAC" --asset_code "$ASSET_CODE_HEX" --issuer_pubkey "$PUBLISHER_KEY_HEX"
    ```
-3. Enable signature verification:
+3. Enable signature verification for that asset:
    ```bash
    stellar contract invoke --id "$PRICE_GUARD_CID" --source admin --network "$NETWORK" -- configure_signature_requirement \
-     --admin "$ADMIN" --required true
+     --admin "$ADMIN" --asset "$RWA_SAC" --required true
    ```
 
-This was a breaking change to `publish_nav`'s call signature. Both `scripts/deploy.sh` and
-`scripts/e2e-smoke.sh` have since been updated for it (verified against a real testnet deployment
-— see `TESTNET_DEPLOYMENT.md`):
-
-- `scripts/e2e-smoke.sh`'s `publish_nav` call passes `--asset_code` (the hex-encoded UTF-8 bytes
-  of `"RWA1"`) and a real signature from `scripts/sign-nav.mjs`.
+`scripts/configure-nav-key.sh` does steps 2 and 3 (it hex-encodes `RWA_ASSET_CODE`, default
+`RWA1`), and `scripts/e2e-smoke.sh` signs `ballast-nav-v1:${PRICE_GUARD_CID}:RWA1:${NAV_TS}:${NAV_VALUE}`
+with `scripts/sign-nav.mjs` and calls `publish_nav` without `asset_code`.
 
 ### Per-asset signature requirement (breaking ABI change, #95)
 
@@ -258,7 +276,8 @@ leaves every other asset on the same PriceGuard signature-checked:
 
 `PriceGuard` keeps every per-asset entry (`Config`, `Source`, `SourceNames`, `NavRecord`,
 `LastGood`, `RollingReference`, `RollingReferenceUpdated`, `Halted`, `PendingHaltValue`,
-`IssuerPubKey`, `RequireNavSignature`, `LastStatus`) in persistent storage, one entry per key, with
+`IssuerPubKey`, `AssetCode`, `RequireNavSignature`, `LastStatus`, `SourceAllowed`,
+`SourceMaxStaleness`) in persistent storage, one entry per key, with
 the TTL extended (`ttl::extend_persistent`) whenever it is read or written. The instance entry,
 which every publish and every consumer's `guarded_price` loads, holds only the roles, a pending
 admin transfer and the timelock id counter, so its size no longer grows with the number of assets.
@@ -275,7 +294,9 @@ To migrate an existing deployment:
 - Testnet/local: run `scripts/redeploy-price-guard.sh [network]`. It deploys and initializes a new
   PriceGuard, configures `RWA1`, registers the NAV attestor key and requires signatures
   (`scripts/configure-nav-key.sh`), and repoints PledgeVault, CreditLine, ExitDesk and RepoDvp at it.
-- Any other asset on the old contract: run `configure_asset`, `configure_issuer_key` and
+- Any other asset on the old contract: run `configure_asset`, `configure_issuer_key` (with its
+  hex-encoded `--asset_code`; signatures are bound to the new contract id, so the publisher must
+  sign for the new id too) and
   `configure_signature_requirement --required true` for it on the new contract, and repoint each
   consumer's `configure_asset` at the new id.
 - The price history (`LastGood`, rolling reference, status) is rebuilt by the next publishes. If an
@@ -307,7 +328,8 @@ stellar contract invoke --id "$PRICE_GUARD_CID" --network testnet --source admin
 #    `publish_nav` verifies `sig` against the registered issuer key, not the price_publisher role,
 #    so the new publisher cannot publish NAV until this call lands.
 stellar contract invoke --id "$PRICE_GUARD_CID" --network testnet --source admin -- \
-  configure_issuer_key --admin "$ADMIN" --asset "$RWA_SAC" --issuer_pubkey "$NEW_PUBLISHER_KEY_HEX"
+  configure_issuer_key --admin "$ADMIN" --asset "$RWA_SAC" --asset_code "$ASSET_CODE_HEX" \
+  --issuer_pubkey "$NEW_PUBLISHER_KEY_HEX"
 stellar contract invoke --id "$PRICE_GUARD_CID" --network testnet --source admin -- \
   configure_signature_requirement --admin "$ADMIN" --asset "$RWA_SAC" --required true
 ```
@@ -380,7 +402,7 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
 | `cancel_upgrade` | Admin | Immediate | Intended | Aborts a proposed contract bytecode upgrade. |
 | `execute_upgrade` | Anyone | 48h after queue | Intended | Applies bytecode upgrade after the 48h delay has elapsed. |
 | `configure_asset` | Admin | Dynamic | Intended | Initial asset onboarding and tightening safety bands (narrower price band, shorter max staleness) take effect immediately to enhance security. Loosening bands requires 48h timelock via `queue_config` to prevent stealth weakening of outlier defenses. |
-| `configure_issuer_key` | Admin | Dynamic | Intended | Initial attestor key registration is immediate for onboarding. Rotating an existing attestor key requires 48h timelock via `queue_config` to prevent immediate hijacking of the NAV signer. |
+| `configure_issuer_key` | Admin | Dynamic | Intended | Initial attestor key registration is immediate for onboarding. Rotating an existing attestor key requires 48h timelock via `queue_config` to prevent immediate hijacking of the NAV signer. Since #90 it also binds the asset's `asset_code`, which every signed NAV message includes together with the contract id; the code is bound once and a different code is refused, because rebinding would let a signature made for another asset verify immediately. |
 | `configure_signature_requirement` | Admin | Dynamic | Intended | Per asset since #95 (`configure_signature_requirement(admin, asset, required)`), so one transaction cannot switch checks off for every asset; an asset never configured defaults to `true`. Requiring signatures (`required = true`) takes effect immediately. Turning a requirement off relaxes security and must go through the 48h timelock via `queue_config(RequireNavSignature(asset, false))`. Exception: while an asset is being brought up (flag never set and no reading published yet), `required = false` applies immediately. |
 | `configure_source` | Admin | Immediate | Intended | Source allowlist (#84): `publish_source` rejects any name not enabled for the asset, so one feed cannot be counted twice under two spellings. Enabling or disabling a name applies at once and re-evaluates the price; `issuer` is reserved for `publish_nav`. |
 | `remove_source` | Admin | Immediate | Intended | Drops a source's reading, its allowlist entry and any staleness override at once, so an exploited, manipulated or failing feed stops counting in the median immediately. |

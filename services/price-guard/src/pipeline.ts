@@ -87,7 +87,7 @@ export async function runPriceUpdateCycle(
       let navAttestError: { source: string; reason: string } | undefined;
       if (!shadow && signer && nav) {
         try {
-          navSig = await attestNav(signer, asset.code, nav.ts, nav.value);
+          navSig = await attestNav(signer, priceGuardClient!.contractAddress, asset.code, nav.ts, nav.value);
         } catch (err) {
           const reason = `issuer NAV attest failed: ${err instanceof Error ? err.message : String(err)}`;
           navAttestError = { source: "issuer NAV", reason };
@@ -146,7 +146,6 @@ export async function runPriceUpdateCycle(
           const navUnsignedXdr = await client.publishNav(
             publisherPublicKey,
             asset.contractC,
-            asset.code,
             nav.value,
             nav.ts,
             navSig,

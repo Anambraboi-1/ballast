@@ -18,7 +18,8 @@ off-chain arithmetic. `Degraded` and `Halted` fire `price_degraded` / `price_hal
 source or asset does not stop the others.
 
 Issuers do not sign NAV, so the price-publisher key signs each NAV reading itself over
-`<assetCode>:<ts>:<value>` (`navAttestor.ts`) and checks the signature against its own public key before
+`ballast-nav-v1:<contract>:<assetCode>:<ts>:<value>` (`navAttestor.ts`), where `<contract>` is the
+PriceGuard's `C...` id, so a signature only verifies on that deployment and for that asset (#90), and checks the signature against its own public key before
 sending. `PriceGuard.publish_nav` verifies it on-chain against the key set by `configure_issuer_key`. This
 attests "Ballast's publisher saw this value from the issuer API", not that the issuer vouched for it.
 

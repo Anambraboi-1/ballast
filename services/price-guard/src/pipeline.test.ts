@@ -102,6 +102,7 @@ function makeAsset(overrides: Partial<AssetConfig> = {}): AssetConfig {
 
 function makeClient(guarded: Record<string, unknown> = {}) {
   return {
+    contractAddress: "CPRICEGUARD",
     publishNav: vi.fn().mockResolvedValue("unsigned-nav-xdr"),
     publishFeed: vi.fn().mockResolvedValue("unsigned-feed-xdr"),
     guardedPrice: vi.fn().mockResolvedValue({
@@ -150,17 +151,17 @@ describe("runPriceUpdateCycle", () => {
     expect(db.values).toHaveBeenNthCalledWith(3, expect.objectContaining({ assetId: "asset-1", status: "Ok" }));
 
     // The NAV signature is made by the publisher key and verifies over the canonical message.
-    const [, , code, value, ts, sig] = client.publishNav.mock.calls[0];
-    expect(code).toBe("CETES");
+    const [, , value, ts, sig] = client.publishNav.mock.calls[0];
     expect(value).toBe(657_660n);
     expect(ts).toBe(1_791_447_179);
-    expect(verifyNavSignature(code, ts, value, sig, attestorPublicKeyBase64(sendSigner as any))).toBe(true);
+    expect(verifyNavSignature(client.contractAddress, "CETES", ts, value, sig, attestorPublicKeyBase64(sendSigner as any))).toBe(true);
 
     // Assert the signature stored on the issuer_nav row also verifies.
     const storedNavSig = ((db.values as any).mock.calls[0][0]).signature;
     expect(
       verifyNavSignature(
-        code,
+        client.contractAddress,
+        "CETES",
         ts,
         value,
         Buffer.from(storedNavSig, "base64"),
