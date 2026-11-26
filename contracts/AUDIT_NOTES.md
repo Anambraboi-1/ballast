@@ -402,6 +402,22 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
 - No contract has been audited. `cargo test` covers the unit tests in each crate; the end-to-end
   scripts in `scripts/` exercise them on testnet.
 
+## PRD Invariants Traceability (RepoDvP & ExitDesk)
+
+Traceability matrix mapping core PRD invariants (§8) to unit and integration test coverage across `RepoDvP` and `ExitDesk`.
+
+| Invariant | Description | Contract | Status | Covering Test(s) / Gap Issue |
+|---|---|---|---|---|
+| **2** | No draws/exits/repos on a bad price (must be `Ok`) | `ExitDesk` | Covered | `test::exit_panics_on_degraded_price`<br>`test::exit_panics_on_halted_price` |
+| **2** | No draws/exits/repos on a bad price (must be `Ok`) | `RepoDvP` | NOT COVERED | Gap: `propose` and `accept_and_settle` never read `PriceGuard` (see [#1278](https://github.com/DevTobis/ballast/issues/1278)) |
+| **5** | Pausing cannot move funds; blocks new risk only | `ExitDesk` | Covered | `test::pauser_can_pause_exits_and_exit_panics_while_quote_and_withdraw_work`<br>`test::pauser_can_pause_all_and_exit_panics_while_quote_and_withdraw_work` |
+| **5** | Pausing cannot move funds; blocks new risk only | `RepoDvP` | Covered | `test::sac::pausing_repos_stops_accept_and_settle`<br>`test::sac::pausing_all_stops_accept_and_settle_too`<br>`test::sac::unwind_still_works_while_paused`<br>`test::sac::margin_cure_and_default_paths_still_work_while_paused`<br>`test::sac::default_close_still_works_while_paused` |
+| **6** | Admin cannot move user funds | `ExitDesk` | Partial | By design the admin **can** withdraw the desk's own USDC float and RWA inventory (`test::the_admin_can_take_the_usdc_float_back_out`, `test::withdrawing_rwa_inventory_frees_room_under_the_inventory_cap`); `test::only_the_admin_can_withdraw` shows nobody else can. This exception is documented under [Admin-set parameters that change settlement value](#admin-set-parameters-that-change-settlement-value) (#209). Holder funds never sit in the desk between calls, since `exit` is atomic. |
+| **6** | Admin cannot move user funds | `RepoDvP` | NOT COVERED | Gap: No admin fund sweep function exists, but no explicit negative unit test asserts immobility of pledged user funds against admin keys (see [#1279](https://github.com/DevTobis/ballast/issues/1279)) |
+| **7** | Repo / swap legs are atomic (both settle or neither) | `ExitDesk` | Covered | `test::exit_happy_path_settles_both_legs`<br>`test::an_exit_refused_for_a_short_float_changes_nothing`<br>`test::exit_panics_when_the_float_is_one_stroop_short_of_the_payout` |
+| **7** | Repo / swap legs are atomic (both settle or neither) | `RepoDvP` | Covered | `test::accept_and_settle_reverts_atomically_on_insufficient_cash` |
+| **8** | Issuer controls stay intact (unauthorized recipient reverts) | `ExitDesk` | NOT COVERED | Gap: In-crate unit tests use mock tokens without Stellar Asset Contract (SAC) `AUTH_REQUIRED` verification (see [#1280](https://github.com/DevTobis/ballast/issues/1280)) |
+| **8** | Issuer controls stay intact (unauthorized recipient reverts) | `RepoDvP` | NOT COVERED | Gap: In-crate unit tests use mock tokens without SAC authorization revocation checks (see [#1280](https://github.com/DevTobis/ballast/issues/1280)) |
 ### Missing hardening
 
 Each item below is a gap in the current code, not a finding about exploitability. Remove a bullet
