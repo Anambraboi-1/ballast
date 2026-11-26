@@ -2014,6 +2014,106 @@ mod test {
             .draw(&h.borrower, &id, &(700 * PRICE_SCALE), &to);
     }
 
+    // --- draw: interest accrual (#163) ----------------------------------------------------
+
+    const OPENED_AT: u64 = 1_000;
+    const ONE_YEAR: u64 = 365 * 24 * 60 * 60;
+
+    /// Opens a 10% (1,000 bps), fee-free line at `OPENED_AT`, pledges 1,000 units at $1 with no
+    /// haircut, draws 600, and advances the ledger one year. At that point 60 of interest is owed
+    /// but not yet booked: `line.accrued_interest` is still zero until something calls `accrue`.
+    fn line_a_year_after_drawing_600(h: &Harness) -> u64 {
+        h.env.ledger().set_timestamp(OPENED_AT);
+        let id = open_and_fund(h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.credit_line.sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+        h.credit_line.draw(&h.borrower, &id, &(600 * PRICE_SCALE), &h.borrower.clone());
+
+        h.env.ledger().set_timestamp(OPENED_AT + ONE_YEAR);
+        let line = h.credit_line.line(&id);
+        assert_eq!(line.accrued_interest, 0);
+        assert_eq!(line.last_accrual_ts, OPENED_AT);
+        id
+    }
+
+    /// `draw` books the interest accrued since the last accrual before drawing, counts it in the
+    /// post-draw LTV, and moves `last_accrual_ts` to now. 600 drawn + 60 accrued + 30 = 690 -> 6,900
+    /// bps (Healthy).
+    #[test]
+    fn draw_books_accrued_interest_and_moves_last_accrual_ts() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = line_a_year_after_drawing_600(&h);
+
+        let to = Address::generate(&h.env);
+        h.credit_line.draw(&h.borrower, &id, &(30 * PRICE_SCALE), &to);
+
+        // Read the event first: `events().all()` only holds the latest invocation's events.
+        // The `drawn` event's LTV is the post-draw one, interest included: 690 -> 6,900 bps.
+        let events = h.env.events().all().filter_by_contract(&h.credit_line.address);
+        let items = events.events();
+        assert_eq!(items.len(), 1);
+        let body = match &items[0].body {
+            soroban_sdk::xdr::ContractEventBody::V0(b) => b,
+        };
+        let data: (i128, Address, i128, u32) = TryFromVal::try_from_val(
+            &h.env,
+            &soroban_sdk::Val::try_from_val(&h.env, &body.data).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(data.3, 6_900);
+
+        let line = h.credit_line.line(&id);
+        assert_eq!(line.accrued_interest, 60 * PRICE_SCALE);
+        assert_eq!(line.accrued_fee, 0);
+        assert_eq!(line.last_accrual_ts, OPENED_AT + ONE_YEAR);
+        assert_eq!(line.drawn, 630 * PRICE_SCALE);
+        assert_eq!(h.token.balance(&to), 30 * PRICE_SCALE);
+        assert_eq!(h.credit_line.debt_of(&id), 690 * PRICE_SCALE);
+    }
+
+    /// Draw 100: 700 ignoring interest is already Warning, and 760 with it is Warning too.
+    #[test]
+    #[should_panic(expected = "credit-line: draw would push the line past a healthy LTV")]
+    fn draw_of_100_a_year_after_drawing_600_is_refused() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = line_a_year_after_drawing_600(&h);
+        h.credit_line
+            .draw(&h.borrower, &id, &(100 * PRICE_SCALE), &h.borrower.clone());
+    }
+
+    /// Draw 90: 690 ignoring interest would be Healthy (6,900 bps), but 750 with the year's 60 of
+    /// interest is 7,500 bps (Warning), so it is refused. A `draw` that skipped `accrue` would let
+    /// this through.
+    #[test]
+    fn draw_healthy_only_if_interest_is_ignored_is_refused_and_books_nothing() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = line_a_year_after_drawing_600(&h);
+
+        // Same thresholds as `setup`.
+        let thresholds = MarginThresholds {
+            warning_bps: 7_000,
+            margin_call_bps: 8_000,
+            liquidation_bps: 9_000,
+        };
+        let ignoring_interest = risk::ltv_bps(690 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        let with_interest = risk::ltv_bps(750 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        assert_eq!(margin::classify(ignoring_interest, &thresholds), MarginState::Healthy);
+        assert_eq!(margin::classify(with_interest, &thresholds), MarginState::Warning);
+
+        let result = h
+            .credit_line
+            .try_draw(&h.borrower, &id, &(90 * PRICE_SCALE), &h.borrower.clone());
+        assert!(result.is_err(), "750 of post-draw debt is Warning and must be refused");
+
+        // The refused draw reverted whole: nothing drawn, no interest booked, clock unmoved.
+        let line = h.credit_line.line(&id);
+        assert_eq!(line.drawn, 600 * PRICE_SCALE);
+        assert_eq!(line.accrued_interest, 0);
+        assert_eq!(line.last_accrual_ts, OPENED_AT);
+    }
+
     #[test]
     fn repay_works_while_draws_paused_but_draw_does_not() {
         let h = setup(500, PRICE_SCALE, PriceStatus::Ok);
