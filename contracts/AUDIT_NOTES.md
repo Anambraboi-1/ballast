@@ -267,7 +267,9 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
   borrower in the same call, records any shortfall, writes unrecovered principal off `funded` and
   closes the line. The lender cannot choose the price, understate the collateral, or close while
   collateral remains in the vault, but **can choose when to close**; until they do the line stays
-  `Liquidating` and the borrower's surplus is not paid. There is no borrower-side or keeper-side close.
+  `Liquidating` and the borrower's surplus is not paid. There is no borrower-side or keeper-side close of a *liquidated* line. A fully repaid `Open` line
+  (no principal, interest, fee or funding left) can be closed by its lender or borrower with
+  `close`; `close` refuses a `Liquidating` line, so it cannot bypass `close_liquidated` (#130).
 - **Lender withdrawals** exist because without them repaid principal and interest were locked in
   the contract. `withdraw_undrawn` returns committed USDC that is not out on loan (reducing
   `funded`); `withdraw_interest` returns repaid interest, tracked separately in `Claimable(line)`.
