@@ -279,7 +279,13 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
   collateral at the *frozen* price with no haircut, books any surplus as a borrower claim, records
   any shortfall, writes unrecovered principal off `funded` and closes the line. The lender cannot
   choose the price, understate the collateral, or close while collateral remains in the vault, but
-  **can choose when to close**; until they do the line stays `Liquidating`. There is no borrower-side or keeper-side close of a *liquidated* line. A fully repaid `Open` line
+  **can choose when to close** first: for `CLOSE_GRACE_S` (7 days) after `liquidate` only the
+  lender can close. After that the borrower or the keeper can call `close_expired` (#133), which
+  books the identical outcome through the same code (same vault check, frozen price, waived unpaid
+  fee, surplus booked for `claim_surplus`), so a lost lender key cannot leave the line `Liquidating`
+  forever. **Limit:** after a `close_expired` the surplus is still pulled from the lender's
+  allowance; a lender who has disappeared will not grant one, so the borrower's claim is recorded
+  but not paid until they do. A fully repaid `Open` line
   (no principal, interest, fee or funding left) can be closed by its lender or borrower with
   `close`; `close` refuses a `Liquidating` line, so it cannot bypass `close_liquidated` (#130).
 - **The surplus is a pull payment (#149).** `close_liquidated` moves no USDC: a positive surplus is
@@ -289,7 +295,8 @@ The table below catalogs every admin, risk, and pauser entry point in `Registry`
   pays out at most once, and a failed transfer reverts and leaves it recorded. Break-even and
   shortfall closes record nothing. **Limit:** the contract cannot make the lender fund the claim;
   until the lender approves and holds the amount, the borrower's claim stays outstanding and
-  visible through `surplus_owed(line)`. The keeper job is unaffected (it never closes lines).
+  visible through `surplus_owed(line)`. The keeper job does not have to change; it may call
+  `close_expired` after the grace period but is not required to.
 - **Lender withdrawals** exist because without them repaid principal and interest were locked in
   the contract. `withdraw_undrawn` returns committed USDC that is not out on loan (reducing
   `funded`); `withdraw_interest` returns repaid interest, tracked separately in `Claimable(line)`.

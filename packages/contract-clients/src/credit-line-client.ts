@@ -74,6 +74,8 @@ export interface OnChainLiquidationRecord {
   recovered: bigint;
   surplus: bigint;
   shortfall: bigint;
+  /** Ledger timestamp (seconds) at which `liquidate` froze the record; `closeExpired` waits `CLOSE_GRACE_S` from here. */
+  liquidatedAt?: bigint;
 }
 
 export class CreditLineClient extends BaseContractClient {
@@ -188,6 +190,14 @@ export class CreditLineClient extends BaseContractClient {
    */
   closeLiquidated(source: string, line: bigint): Promise<string> {
     return this.invoke(source, "close_liquidated", [scAddress(source), scU64(line)]);
+  }
+
+  /**
+   * Borrower or keeper closes a liquidated line once 7 days (`CLOSE_GRACE_S`) have passed since
+   * `liquidate`, booking the same outcome as `closeLiquidated`.
+   */
+  closeExpired(source: string, line: bigint): Promise<string> {
+    return this.invoke(source, "close_expired", [scAddress(source), scU64(line)]);
   }
 
   /**

@@ -65,7 +65,7 @@ consumer changes and a redeploy, and this file has to be updated in the same PR.
 | `repaid` | `line: u64` | `(payer: Address, interest_paid: i128, principal_paid: i128, drawn_after: i128)` | `repay` (any payer) | indexer (stored only) |
 | `margin_state_changed` | `line: u64` | `(from: MarginState, to: MarginState, ltv_bps: u32, price: i128)` | `poke`, only when the state changes | indexer (stored only) |
 | `liquidation_started` | `line: u64` | `(route: LiquidationRoute, seized_units: i128, price: i128, debt: i128)` | `liquidate` (keeper) | indexer (stored only) |
-| `line_closed` | `line: u64` | `(debt: i128, recovered: i128, surplus: i128, shortfall: i128)` | `close_liquidated` (lender) | indexer (stored only) |
+| `line_closed` | `line: u64` | `(debt: i128, recovered: i128, surplus: i128, shortfall: i128)` | `close_liquidated` (lender), or `close_expired` (borrower or keeper, after 7 days) | indexer (stored only) |
 | `surplus_claimed` | `line: u64` | `(borrower: Address, lender: Address, amount: i128)` | `claim_surplus` (borrower) | indexer (stored only) |
 | `line_closed_repaid` | `line: u64` | `caller: Address` (bare value) | `close` (lender or borrower) on a fully repaid `Open` line | indexer (stored only) |
 | `undrawn_withdrawn` | `line: u64` | `(lender: Address, amount: i128, funded_after: i128)` | `withdraw_undrawn` (lender) | indexer (stored only) |

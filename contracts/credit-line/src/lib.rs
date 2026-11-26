@@ -106,6 +106,12 @@ const SECONDS_PER_YEAR: i128 = 365 * 24 * 60 * 60;
 const BPS_DENOMINATOR: i128 = 10_000;
 const MAX_FEE_BPS: u32 = 10_000;
 
+/// How long after `liquidate` the lender has to call `close_liquidated` before the borrower or the
+/// keeper may close the line with `close_expired` instead (#133): 7 days. The outcome is frozen in
+/// the `LiquidationRecord` at liquidation, so a late close cannot be gamed by price movement; the
+/// grace only gives the lender the first chance to book it.
+pub const CLOSE_GRACE_S: u64 = 7 * 24 * 60 * 60;
+
 /// The largest annual rate `open` accepts, in bps: 10,000 = 100% a year, the same cap `RepoDvP`
 /// applies to a repo's `rate_bps`. A larger rate makes `interest_delta`'s
 /// `drawn * rate_bps * elapsed` product grow fast enough to trap on i128 overflow for a large
@@ -224,10 +230,14 @@ pub struct LiquidationRecord {
     pub closed: bool,
     /// `seized_units * price`, no haircut. Zero until the line is closed.
     pub recovered: i128,
-    /// Value of the collateral above the debt, paid by the lender to the borrower in USDC.
+    /// Value of the collateral above the debt, owed by the lender to the borrower in USDC and
+    /// pulled with `claim_surplus`.
     pub surplus: i128,
     /// Debt the collateral did not cover: the lender's loss.
     pub shortfall: i128,
+    /// Ledger timestamp at which `liquidate` froze this record. `close_expired` measures its grace
+    /// period from here.
+    pub liquidated_at: u64,
 }
 
 #[contracttype]
@@ -369,6 +379,61 @@ fn write_surplus_owed(env: &Env, line: u64, amount: i128) {
     } else {
         env.storage().persistent().remove(&key);
     }
+}
+
+/// Books a liquidated line's frozen outcome and closes it; shared by `close_liquidated` and
+/// `close_expired` so both produce the same result for the same record. Refuses while the seized
+/// collateral is still in `PledgeVault` (#134). Moves no USDC: a surplus is booked for
+/// `claim_surplus` (#149).
+fn book_liquidated_close(env: &Env, line: u64, mut state: Line, mut record: LiquidationRecord) {
+    let env = env.clone();
+    let vault_opt: Option<Address> = env.storage().instance().get(&DataKey::Vault);
+    match vault_opt {
+        Some(vault) => {
+            let remaining =
+                PledgeVaultClient::new(&env, &vault).position_units(&line, &state.asset);
+            assert_eq!(
+                remaining, 0,
+                "credit-line: collateral has not left the vault"
+            );
+        }
+        None => {
+            assert!(
+                record.seized_units == 0 && state.pledged_units == 0,
+                "credit-line: vault not configured"
+            );
+        }
+    }
+
+    let recovered = risk::collateral_value(record.seized_units, record.price, 0);
+    let surplus = (recovered - record.debt).max(0);
+    let shortfall = (record.debt - recovered).max(0);
+
+    state.funded -= state.drawn;
+    state.drawn = 0;
+    state.accrued_interest = 0;
+    state.accrued_fee = 0;
+    state.pledged_units = 0;
+    state.margin_state = MarginState::Healthy;
+    state.breach_ledger = None;
+    state.breach_ltv_bps = 0;
+    state.unhealthy_since = None;
+    state.status = LineStatus::Closed;
+    write_line(&env, line, &state);
+
+    record.closed = true;
+    record.recovered = recovered;
+    record.surplus = surplus;
+    record.shortfall = shortfall;
+    write_liquidation(&env, line, &record);
+    // Booked, not paid: the borrower pulls it with `claim_surplus`. No USDC moves here, so a
+    // lender whose balance is short can still close the line.
+    write_surplus_owed(&env, line, surplus);
+
+    env.events().publish(
+        (Symbol::new(&env, "line_closed"), line),
+        (record.debt, recovered, surplus, shortfall),
+    );
 }
 
 fn read_asset_config(env: &Env, asset: &Address) -> AssetConfig {
@@ -921,6 +986,7 @@ impl CreditLine {
                 recovered: 0,
                 surplus: 0,
                 shortfall: 0,
+                liquidated_at: now,
             },
         );
 
@@ -954,62 +1020,47 @@ impl CreditLine {
         ttl::extend_instance(&env);
         lender.require_auth();
 
-        let mut state = read_line(&env, line);
+        let state = read_line(&env, line);
         assert_eq!(state.lender, lender, "credit-line: not this line's lender");
         assert!(
             state.status == LineStatus::Liquidating,
             "credit-line: line is not being liquidated"
         );
 
-        let mut record = read_liquidation(&env, line);
+        let record = read_liquidation(&env, line);
+        book_liquidated_close(&env, line, state, record);
+    }
 
-        let vault_opt: Option<Address> = env.storage().instance().get(&DataKey::Vault);
-        match vault_opt {
-            Some(vault) => {
-                let remaining =
-                    PledgeVaultClient::new(&env, &vault).position_units(&line, &state.asset);
-                assert_eq!(
-                    remaining, 0,
-                    "credit-line: collateral has not left the vault"
-                );
-            }
-            None => {
-                assert!(
-                    record.seized_units == 0 && state.pledged_units == 0,
-                    "credit-line: vault not configured"
-                );
-            }
-        }
+    /// Closes a liquidated line without the lender once `CLOSE_GRACE_S` has passed since
+    /// `liquidate` (#133), so a lost or unresponsive lender key cannot leave the line `Liquidating`
+    /// forever. Callable by the line's borrower or the protocol keeper.
+    ///
+    /// Books exactly the outcome `close_liquidated` would for the same record (shared code): the
+    /// same vault check (the seized collateral must have left `PledgeVault`, or the borrower could
+    /// close and then `release` it), the frozen price, the waived unpaid fee, and any surplus
+    /// booked in `SurplusOwed(line)` for the borrower to pull with `claim_surplus`. That pull still
+    /// needs the lender's USDC allowance; a lender who has disappeared will not grant one, so in
+    /// that case the claim stays recorded but unpaid (see AUDIT_NOTES).
+    pub fn close_expired(env: Env, caller: Address, line: u64) {
+        ttl::extend_instance(&env);
+        caller.require_auth();
 
-        let recovered = risk::collateral_value(record.seized_units, record.price, 0);
-        let surplus = (recovered - record.debt).max(0);
-        let shortfall = (record.debt - recovered).max(0);
-
-        state.funded -= state.drawn;
-        state.drawn = 0;
-        state.accrued_interest = 0;
-        state.accrued_fee = 0;
-        state.pledged_units = 0;
-        state.margin_state = MarginState::Healthy;
-        state.breach_ledger = None;
-        state.breach_ltv_bps = 0;
-        state.unhealthy_since = None;
-        state.status = LineStatus::Closed;
-        write_line(&env, line, &state);
-
-        record.closed = true;
-        record.recovered = recovered;
-        record.surplus = surplus;
-        record.shortfall = shortfall;
-        write_liquidation(&env, line, &record);
-        // Booked, not paid: the borrower pulls it with `claim_surplus`. No USDC moves here, so a
-        // lender whose balance is short can still close the line.
-        write_surplus_owed(&env, line, surplus);
-
-        env.events().publish(
-            (Symbol::new(&env, "line_closed"), line),
-            (record.debt, recovered, surplus, shortfall),
+        let state = read_line(&env, line);
+        assert!(
+            state.status == LineStatus::Liquidating,
+            "credit-line: line is not being liquidated"
         );
+        let roles = access::read_roles(&env);
+        assert!(
+            caller == state.borrower || caller == roles.keeper,
+            "credit-line: caller must be the borrower or the keeper"
+        );
+        let record = read_liquidation(&env, line);
+        assert!(
+            env.ledger().timestamp() >= record.liquidated_at + CLOSE_GRACE_S,
+            "credit-line: close grace period has not elapsed"
+        );
+        book_liquidated_close(&env, line, state, record);
     }
 
     /// Pays the borrower the liquidation surplus booked by `close_liquidated`, pulling it from the
@@ -4112,6 +4163,7 @@ mod test {
                     recovered: 0,
                     surplus: 0,
                     shortfall: 0,
+                    liquidated_at: 0,
                 },
             );
         });
@@ -4634,5 +4686,160 @@ mod test {
             .sync_collateral(&h.admin, &id, &(300 * PRICE_SCALE));
         h.credit_line.sync_collateral(&h.keeper, &id, &0);
         assert_eq!(h.credit_line.line(&id).pledged_units, 0);
+    }
+
+    // --- close_expired (#133) ---------------------------------------------------------------
+
+    fn past_grace(h: &Harness, id: u64) {
+        let at = h.credit_line.liquidation_record(&id).liquidated_at;
+        h.env.ledger().set_timestamp(at + CLOSE_GRACE_S);
+    }
+
+    #[test]
+    fn liquidate_records_when_it_froze_the_outcome() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let before = h.env.ledger().timestamp();
+        let id = liquidated_line(&h, PRICE_SCALE / 2);
+        assert_eq!(h.credit_line.liquidation_record(&id).liquidated_at, before);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: close grace period has not elapsed")]
+    fn close_expired_cannot_run_one_second_before_the_grace_period_ends() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, PRICE_SCALE / 2);
+        let at = h.credit_line.liquidation_record(&id).liquidated_at;
+        h.env.ledger().set_timestamp(at + CLOSE_GRACE_S - 1);
+        h.credit_line.close_expired(&h.borrower, &id);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: caller must be the borrower or the keeper")]
+    fn a_stranger_cannot_close_expired() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, PRICE_SCALE / 2);
+        past_grace(&h, id);
+        h.credit_line.close_expired(&Address::generate(&h.env), &id);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: caller must be the borrower or the keeper")]
+    fn the_lender_uses_close_liquidated_not_close_expired() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, PRICE_SCALE / 2);
+        past_grace(&h, id);
+        h.credit_line.close_expired(&h.lender, &id);
+    }
+
+    #[test]
+    #[should_panic(expected = "credit-line: line is not being liquidated")]
+    fn close_expired_refuses_an_open_line() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = open_and_fund(&h, 1_000 * PRICE_SCALE, 1_000 * PRICE_SCALE);
+        h.env
+            .ledger()
+            .set_timestamp(h.env.ledger().timestamp() + CLOSE_GRACE_S + 1);
+        h.credit_line.close_expired(&h.borrower, &id);
+    }
+
+    /// The review's fund-safety case: if the keeper has not yet seized the collateral in the
+    /// vault, closing would zero the debt and let the borrower `release` everything.
+    #[test]
+    #[should_panic(expected = "credit-line: collateral has not left the vault")]
+    fn close_expired_refuses_while_collateral_is_still_in_the_vault() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let id = liquidated_line(&h, PRICE_SCALE / 2);
+        h.vault.set_position_units(&id, &h.asset, &(1_000 * PRICE_SCALE));
+        past_grace(&h, id);
+        h.credit_line.close_expired(&h.borrower, &id);
+    }
+
+    #[test]
+    fn the_borrower_can_close_expired_and_then_claim_the_surplus() {
+        let h = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        // $0.64: 1,000 units are worth 640 against 600 of debt -> 40 surplus.
+        let id = liquidated_line(&h, 64 * PRICE_SCALE / 100);
+        past_grace(&h, id);
+        h.credit_line.close_expired(&h.borrower, &id);
+
+        let record = h.credit_line.liquidation_record(&id);
+        assert!(record.closed);
+        assert_eq!(record.recovered, 640 * PRICE_SCALE);
+        assert_eq!(record.surplus, 40 * PRICE_SCALE);
+        assert_eq!(record.shortfall, 0);
+        assert_eq!(h.credit_line.surplus_owed(&id), 40 * PRICE_SCALE);
+        let line = h.credit_line.line(&id);
+        assert_eq!(line.status, LineStatus::Closed);
+        assert_eq!((line.drawn, line.accrued_interest, line.pledged_units), (0, 0, 0));
+
+        // The claim is the same pull payment `close_liquidated` books.
+        let before = h.token.balance(&h.borrower);
+        h.token.mint(&h.lender, &(40 * PRICE_SCALE));
+        h.token
+            .approve(&h.lender, &h.credit_line.address, &(40 * PRICE_SCALE));
+        h.credit_line.claim_surplus(&h.borrower, &id);
+        assert_eq!(h.token.balance(&h.borrower) - before, 40 * PRICE_SCALE);
+    }
+
+    /// Same record, two paths: the keeper's `close_expired` books exactly what the lender's
+    /// `close_liquidated` books, including the waived unpaid platform fee.
+    #[test]
+    fn close_expired_books_the_same_outcome_as_close_liquidated() {
+        fn fee_line(h: &Harness) -> u64 {
+            let id = h.credit_line.open(
+                &h.lender,
+                &h.borrower,
+                &h.asset,
+                &(1_000 * PRICE_SCALE),
+                &1_000,
+                &200,
+                &86_400,
+                &BytesN::from_array(&h.env, &[7u8; 32]),
+            );
+            h.token.mint(&h.lender, &(1_000 * PRICE_SCALE));
+            h.credit_line.fund(&h.lender, &id, &(1_000 * PRICE_SCALE));
+            h.credit_line
+                .sync_collateral(&h.admin, &id, &(1_000 * PRICE_SCALE));
+            h.credit_line
+                .draw(&h.borrower, &id, &(500 * PRICE_SCALE), &h.borrower.clone());
+            h.env.ledger().with_mut(|l| l.timestamp += 365 * 24 * 60 * 60);
+            h.price_guard
+                .set_price(&(55 * PRICE_SCALE / 100), &PriceStatus::Ok);
+            h.credit_line.poke(&id);
+            h.env
+                .ledger()
+                .set_sequence_number(h.env.ledger().sequence() + 1);
+            h.credit_line
+                .liquidate(&Address::generate(&h.env), &id, &LiquidationRoute::Transfer);
+            id
+        }
+
+        let a = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let ida = fee_line(&a);
+        a.credit_line.close_liquidated(&a.lender, &ida);
+
+        let b = setup(0, PRICE_SCALE, PriceStatus::Ok);
+        let idb = fee_line(&b);
+        past_grace(&b, idb);
+        b.credit_line.close_expired(&b.keeper, &idb);
+
+        let (ra, rb) = (
+            a.credit_line.liquidation_record(&ida),
+            b.credit_line.liquidation_record(&idb),
+        );
+        assert_eq!(
+            (ra.debt, ra.recovered, ra.surplus, ra.shortfall, ra.closed),
+            (rb.debt, rb.recovered, rb.surplus, rb.shortfall, rb.closed)
+        );
+        let (la, lb) = (a.credit_line.line(&ida), b.credit_line.line(&idb));
+        assert_eq!(
+            (la.funded, la.drawn, la.accrued_interest, la.accrued_fee, la.status),
+            (lb.funded, lb.drawn, lb.accrued_interest, lb.accrued_fee, lb.status)
+        );
+        assert_eq!(lb.accrued_fee, 0);
+        assert_eq!(
+            a.credit_line.surplus_owed(&ida),
+            b.credit_line.surplus_owed(&idb)
+        );
     }
 }
